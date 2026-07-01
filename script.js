@@ -11,6 +11,12 @@ const videoInput = $('#video-upload');
 const createButton = $('#create-ticket');
 const toast = $('#toast');
 let playbackResetTimer = null;
+const TICKET_TEAR_SECONDS = 1;
+const TICKET_OUTRO_SECONDS = .28;
+const PHOTO_PLAY_SECONDS = 7.6;
+const EXPORT_TICKET_Y = 356;
+const LIVE_CROP_TOP = 318;
+let ffmpegRuntimePromise = null;
 
 const state = {
   custom: false,
@@ -67,22 +73,15 @@ async function handleMemorySelection(files) {
     state.coverFile = imageFile || null;
     const movingSource = videoFile || state.motionBlob;
     if (movingSource) {
-      if (await isHevcVideoFile(movingSource)) {
+      try {
+        // Prefer the phone/computer's decoder. The large fallback is loaded only when needed.
+        await prepareFramePicker(movingSource, imageFile, 5000);
+      } catch (directError) {
         $('#memory-label').textContent = '正在转换兼容格式…';
         const compatibleVideo = await normalizeVideoForBrowser(movingSource);
         if (videoFile) state.videoFile = compatibleVideo;
         else state.motionBlob = compatibleVideo;
-        await prepareFramePicker(compatibleVideo, imageFile);
-      } else {
-        try {
-          await prepareFramePicker(movingSource, imageFile);
-        } catch (directError) {
-          $('#memory-label').textContent = '正在转换兼容格式…';
-          const compatibleVideo = await normalizeVideoForBrowser(movingSource);
-          if (videoFile) state.videoFile = compatibleVideo;
-          else state.motionBlob = compatibleVideo;
-          await prepareFramePicker(compatibleVideo, imageFile);
-        }
+        await prepareFramePicker(compatibleVideo, imageFile, 10000);
       }
     }
     else {
@@ -162,31 +161,23 @@ async function transcodeVideoWithWebCodecs(file) {
 }
 
 async function transcodeHevcWithFfmpeg(file) {
-  $('#memory-label').textContent = '正在加载 H.265 读取组件…';
-  const [{FFmpeg}, {toBlobURL}] = await Promise.all([
-    import('./vendor/ffmpeg/index.js'),
-    import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js')
-  ]);
-  const ffmpeg = new FFmpeg();
-  const coreBase = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm';
+  $('#memory-label').textContent = '正在读取 H.265 视频…';
+  const ffmpeg = await getFfmpegRuntime();
   ffmpeg.on('progress', ({progress}) => {
     const percent = Math.max(0, Math.min(99, Math.round(progress * 100)));
     $('#memory-label').textContent = `正在转换 H.265 视频 ${percent}%`;
   });
-  await ffmpeg.load({
-    coreURL: await toBlobURL(`${coreBase}/ffmpeg-core.js`, 'text/javascript'),
-    wasmURL: await toBlobURL(`${coreBase}/ffmpeg-core.wasm`, 'application/wasm')
-  });
-  const inputName = 'selected-hevc.mp4';
-  const outputName = 'compatible-video.mp4';
+  const nonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const inputName = `selected-${nonce}.mp4`;
+  const outputName = `compatible-${nonce}.mp4`;
   await ffmpeg.writeFile(inputName, new Uint8Array(await file.arrayBuffer()));
   const exitCode = await ffmpeg.exec([
     '-i', inputName,
     '-map', '0:v:0',
-    '-vf', 'scale=min(1280\\,iw):-2',
+    '-vf', 'scale=min(960\\,iw):-2',
     '-c:v', 'libx264',
     '-preset', 'ultrafast',
-    '-crf', '25',
+    '-crf', '27',
     '-pix_fmt', 'yuv420p',
     '-movflags', '+faststart',
     '-an', outputName
@@ -195,9 +186,32 @@ async function transcodeHevcWithFfmpeg(file) {
   const bytes = await ffmpeg.readFile(outputName);
   const stableBytes = new Uint8Array(bytes.length);
   stableBytes.set(bytes);
-  ffmpeg.terminate();
+  await Promise.allSettled([ffmpeg.deleteFile(inputName), ffmpeg.deleteFile(outputName)]);
   if (!stableBytes.length) throw new Error('HEVC conversion produced no output');
   return new File([stableBytes.buffer], outputName, {type:'video/mp4'});
+}
+
+async function getFfmpegRuntime() {
+  if (!ffmpegRuntimePromise) {
+    ffmpegRuntimePromise = (async () => {
+      $('#memory-label').textContent = '首次加载 H.265 读取组件…';
+      const [{FFmpeg}, {toBlobURL}] = await Promise.all([
+        import('./vendor/ffmpeg/index.js'),
+        import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js')
+      ]);
+      const ffmpeg = new FFmpeg();
+      const coreBase = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm';
+      await ffmpeg.load({
+        coreURL: await toBlobURL(`${coreBase}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${coreBase}/ffmpeg-core.wasm`, 'application/wasm')
+      });
+      return ffmpeg;
+    })().catch(error => {
+      ffmpegRuntimePromise = null;
+      throw error;
+    });
+  }
+  return ffmpegRuntimePromise;
 }
 
 $('#frame-range').addEventListener('input', () => {
@@ -348,7 +362,7 @@ function openTicket() {
     const video = memory.querySelector('video');
     if (video) { video.currentTime = 0; video.play().catch(() => {}); }
     else playbackResetTimer = setTimeout(closeTicket, 7600);
-  }, 760);
+  }, TICKET_TEAR_SECONDS * 1000);
 }
 
 function createTearParticles() {
@@ -438,7 +452,7 @@ async function exportLive() {
     const nativeMp4 = typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported('video/mp4');
     const [still, result] = await Promise.all([
       renderTicketStill({live:true}),
-      nativeMp4 ? renderTicketVideo({live:true}) : renderTicketMp4WithWebCodecs()
+      'VideoEncoder' in window ? renderTicketMp4WithWebCodecs({live:true}) : renderTicketVideo({live:true})
     ]);
     const base = safeName(state.city) + '-ticket';
     if (result.ext !== 'mp4') throw new Error('This browser cannot encode MP4 Motion Photo');
@@ -455,11 +469,15 @@ async function exportLive() {
   }
 }
 
-async function renderTicketMp4WithWebCodecs() {
+async function renderTicketMp4WithWebCodecs({live = false} = {}) {
   if (!('VideoEncoder' in window) || !('VideoFrame' in window)) throw new Error('WebCodecs H.264 encoding is unavailable');
   const {Output, Mp4OutputFormat, BufferTarget, CanvasSource} = await import('https://cdn.jsdelivr.net/npm/mediabunny@1.50.2/+esm');
   const canvas = document.createElement('canvas');
-  canvas.width = 720; canvas.height = 320;
+  const mobileExport = matchMedia('(pointer: coarse)').matches || innerWidth < 700;
+  canvas.width = live ? 720 : (mobileExport ? 540 : 720);
+  canvas.height = live ? 320 : (mobileExport ? 960 : 1280);
+  const renderScale = canvas.width / 720;
+  const cropTop = live ? LIVE_CROP_TOP : 0;
   const ctx = canvas.getContext('2d');
   const cover = await loadVisual(state.coverFile);
   const memoryImage = await loadVisual(state.imageFile || state.coverFile);
@@ -478,15 +496,22 @@ async function renderTicketMp4WithWebCodecs() {
   const fps = 24;
   output.addVideoTrack(source, {frameRate:fps});
   await output.start();
-  if (moving) { moving.currentTime = 0; await moving.play(); }
+  const timeline = getExportTimeline(moving);
+  if (moving) { moving.pause(); moving.currentTime = 0; }
+  let movingStarted = false;
   const started = performance.now();
-  const totalFrames = Math.ceil(5.6 * fps);
-  for (let frame = 0; frame <= totalFrames; frame++) {
+  const totalFrames = Math.floor(timeline.total * fps);
+  for (let frame = 0; frame < totalFrames; frame++) {
     const t = frame / fps;
     const wait = started + t * 1000 - performance.now();
     if (wait > 1) await new Promise(resolve => setTimeout(resolve, wait));
-    ctx.setTransform(1, 0, 0, 1, 0, -422);
-    drawExportFrame(ctx, t, cover, memoryImage, moving, palette);
+    if (moving && !movingStarted && t >= timeline.contentStart) {
+      moving.currentTime = 0;
+      await moving.play();
+      movingStarted = true;
+    }
+    ctx.setTransform(renderScale, 0, 0, renderScale, 0, -cropTop * renderScale);
+    drawExportFrame(ctx, t, cover, memoryImage, moving, palette, timeline);
     await source.add(t, 1 / fps);
   }
   await output.finalize();
@@ -502,7 +527,10 @@ async function exportAppleLive() {
   button.disabled = true;
   button.querySelector('strong').textContent = '正在生成苹果实况素材…';
   try {
-    const [still, result] = await Promise.all([renderTicketStill({live:true}), renderTicketVideo({live:true})]);
+    const [still, result] = await Promise.all([
+      renderTicketStill({live:true}),
+      'VideoEncoder' in window ? renderTicketMp4WithWebCodecs({live:true}) : renderTicketVideo({live:true})
+    ]);
     const base = safeName(state.city) + '-ticket';
     const files = [
       new File([still], `${base}-cover.JPG`, {type:'image/jpeg'}),
@@ -526,7 +554,7 @@ async function exportVideo() {
   button.disabled = true;
   button.querySelector('strong').textContent = '正在生成视频…';
   try {
-    const result = await renderTicketVideo();
+    const result = 'VideoEncoder' in window ? await renderTicketMp4WithWebCodecs() : await renderTicketVideo();
     downloadBlob(result.blob, safeName(state.city) + '-ticket.' + result.ext);
     closeModal(downloadMenu);
     showToast('票根视频已生成');
@@ -545,7 +573,7 @@ async function renderTicketVideo({live = false} = {}) {
   canvas.width = live ? 720 : (mobileExport ? 540 : 720);
   canvas.height = live ? 320 : (mobileExport ? 960 : 1280);
   const renderScale = canvas.width / 720;
-  const cropTop = live ? 422 : 0;
+  const cropTop = live ? LIVE_CROP_TOP : 0;
   const ctx = canvas.getContext('2d');
   const cover = await loadVisual(state.coverFile);
   const memoryImage = await loadVisual(state.imageFile || state.coverFile);
@@ -556,8 +584,10 @@ async function renderTicketVideo({live = false} = {}) {
     moving.src = URL.createObjectURL(state.videoFile || state.motionBlob);
     moving.muted = true; moving.playsInline = true; moving.loop = false;
     await new Promise((resolve, reject) => { moving.onloadeddata = resolve; moving.onerror = reject; });
-    await moving.play();
+    moving.pause();
+    moving.currentTime = 0;
   }
+  const timeline = getExportTimeline(moving);
   const mime = ['video/mp4','video/webm;codecs=vp9','video/webm'].find(type => MediaRecorder.isTypeSupported(type));
   if (!mime) throw new Error('MediaRecorder unsupported');
   const recorder = new MediaRecorder(canvas.captureStream(mobileExport ? 24 : 30), { mimeType: mime, videoBitsPerSecond: mobileExport ? 3_000_000 : 5_000_000 });
@@ -565,14 +595,20 @@ async function renderTicketVideo({live = false} = {}) {
   recorder.ondataavailable = event => event.data.size && chunks.push(event.data);
   const done = new Promise(resolve => recorder.onstop = resolve);
   const start = performance.now();
+  let movingStarted = false;
   recorder.start(200);
 
   await new Promise(resolve => {
     function frame(now) {
       const elapsed = (now - start) / 1000;
+      if (moving && !movingStarted && elapsed >= timeline.contentStart) {
+        moving.currentTime = 0;
+        moving.play().catch(() => {});
+        movingStarted = true;
+      }
       ctx.setTransform(renderScale, 0, 0, renderScale, 0, -cropTop * renderScale);
-      drawExportFrame(ctx, elapsed, cover, memoryImage, moving, palette);
-      if (elapsed < 5.6) requestAnimationFrame(frame); else resolve();
+      drawExportFrame(ctx, elapsed, cover, memoryImage, moving, palette, timeline);
+      if (elapsed < timeline.total) requestAnimationFrame(frame); else resolve();
     }
     requestAnimationFrame(frame);
   });
@@ -587,7 +623,7 @@ async function renderTicketStill({live = false} = {}) {
   const canvas = document.createElement('canvas');
   canvas.width = 720; canvas.height = live ? 320 : 1280;
   const cover = await loadVisual(state.coverFile);
-  if (live) canvas.getContext('2d').setTransform(1, 0, 0, 1, 0, -422);
+  if (live) canvas.getContext('2d').setTransform(1, 0, 0, 1, 0, -LIVE_CROP_TOP);
   drawExportFrame(canvas.getContext('2d'), 0, cover, cover, null, state.palette || samplePalette(cover));
   return new Promise((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('Still export failed')), 'image/jpeg', .94));
 }
@@ -606,35 +642,127 @@ async function makeAndroidMotionPhoto(stillBlob, videoBlob) {
   return new Blob([jpeg.subarray(0, 2), app1, jpeg.subarray(2), videoBlob], {type:'image/jpeg'});
 }
 
-function drawExportFrame(ctx, t, cover, memoryImage, moving, palette) {
-  const W = 720, H = 1280, x = 54, y = 460, w = 612, h = 245, stubW = 154;
-  const intact = t < 1.05 || t >= 4.7;
-  const tearProgress = Math.max(0, Math.min(1, (t - 1.05) / 1.15));
-  const revealProgress = Math.max(0, Math.min(1, (t - 2.12) / .48));
+function getExportTimeline(moving) {
+  const mediaDuration = moving && Number.isFinite(moving.duration) && moving.duration > 0
+    ? moving.duration
+    : PHOTO_PLAY_SECONDS;
+  const contentStart = TICKET_TEAR_SECONDS;
+  const resetAt = contentStart + mediaDuration;
+  return {tearStart:0, tearDuration:TICKET_TEAR_SECONDS, contentStart, mediaDuration, resetAt, total:resetAt + TICKET_OUTRO_SECONDS};
+}
+
+function drawExportFrame(ctx, t, cover, memoryImage, moving, palette, suppliedTimeline = null) {
+  const W = 720, H = 1280, x = 54, y = EXPORT_TICKET_Y, w = 612, h = 245, stubW = 154;
+  const timeline = suppliedTimeline || getExportTimeline(moving);
+  const {tearStart, tearDuration, contentStart, resetAt} = timeline;
+  const intact = t < tearStart || t >= resetAt;
+  const tearLinear = Math.max(0, Math.min(1, (t - tearStart) / tearDuration));
+  const stubPose = exportTearPose(tearLinear, stubW);
+  const revealProgress = easeOutCubic(Math.max(0, Math.min(1, (t - contentStart) / .45)));
   ctx.fillStyle = palette.background; ctx.fillRect(0, 0, W, H);
+  if (!intact && t < contentStart + .45) {
+    ctx.save();
+    ctx.globalAlpha = .14 * Math.sin(tearLinear * Math.PI);
+    ctx.fillStyle = '#000';
+    roundedPath(ctx, x + 4, y + 10, w, h, 13);
+    ctx.fill();
+    ctx.restore();
+  }
   ctx.save(); roundedPath(ctx, x, y, w, h, 13); ctx.clip();
-  if (intact || t < 2.6) {
+  if (intact || t < contentStart + .45) {
     drawCrop(ctx, cover, x, y, w - stubW, h, 1);
   }
-  if (!intact && t >= 2.12) {
+  if (!intact && t >= contentStart) {
     ctx.globalAlpha = revealProgress;
     drawCrop(ctx, moving && moving.readyState >= 2 ? moving : memoryImage, x, y, w, h, 1);
     ctx.globalAlpha = 1;
   }
   ctx.restore();
   if (intact) drawExportStub(ctx, x + w - stubW, y, stubW, h, 0, palette);
-  else if (t < 2.35) {
-    const resistance = tearProgress < .3 ? Math.sin(tearProgress * 46) * 7 : 0;
-    const release = Math.max(0, (tearProgress - .28) / .72);
-    const sx = x + w - stubW + resistance + release * (stubW + 105);
-    drawExportStub(ctx, sx, y + Math.sin(release * Math.PI) * 12 + release * 24, stubW, h, release * .28, palette);
-    drawExportTear(ctx, x + w - stubW, y, h, tearProgress, palette);
+  else if (t < contentStart + .45) {
+    drawExportTear(ctx, x + w - stubW, y, h, tearLinear, palette);
+    drawExportStub(ctx, x + w - stubW + stubPose.x, y + stubPose.y, stubW, h, stubPose.rotation, palette, {
+      torn: tearLinear > .18,
+      tearProgress: tearLinear,
+      shadow: .28 + stubPose.release * .48,
+      bend: Math.sin(Math.min(1, tearLinear) * Math.PI) * 9
+    });
+    drawExportRipFlash(ctx, x + w - stubW, y, h, tearLinear);
+  } else if (t < resetAt) {
+    drawExportTornEdge(ctx, x + w - stubW, y, h, .18);
   }
 }
 
-function drawExportStub(ctx, x, y, w, h, rotation, palette) {
+function exportTearPose(p, stubW) {
+  const release = easeOutCubic(Math.max(0, (p - .42) / .58));
+  const cssLike = [
+    {p:0, x:0, y:0, r:0},
+    {p:.14, x:-5, y:0, r:-1},
+    {p:.28, x:8, y:-3, r:1},
+    {p:.43, x:-2, y:3, r:-1.5},
+    {p:.58, x:23, y:-2, r:3},
+    {p:.72, x:52, y:9, r:6},
+    {p:1, x:stubW * 1.45, y:69, r:19}
+  ];
+  let a = cssLike[0], b = cssLike[cssLike.length - 1];
+  for (let i = 0; i < cssLike.length - 1; i++) {
+    if (p >= cssLike[i].p && p <= cssLike[i + 1].p) {
+      a = cssLike[i]; b = cssLike[i + 1]; break;
+    }
+  }
+  const local = a === b ? 1 : easeInOutCubic((p - a.p) / Math.max(.001, b.p - a.p));
+  return {
+    x: lerp(a.x, b.x, local) + (1 - release) * Math.sin(p * 78) * 8,
+    y: lerp(a.y, b.y, local),
+    rotation: lerp(a.r, b.r, local) * Math.PI / 180,
+    release
+  };
+}
+
+function drawJaggedStubPath(ctx, w, h, bend = 0, tearProgress = 1) {
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  for (let py = 0; py <= h; py += 11) {
+    const tornHere = py <= h * Math.min(1, tearProgress);
+    const bite = tornHere ? (Math.floor(py / 11) % 2 ? 8 : -3) + Math.sin(py * .09) * 2 : 0;
+    ctx.lineTo(bite + Math.sin((py / h) * Math.PI) * bend, py);
+  }
+  ctx.lineTo(w, h);
+  ctx.lineTo(w, 0);
+  ctx.closePath();
+}
+
+function drawExportStub(ctx, x, y, w, h, rotation, palette, options = {}) {
   ctx.save(); ctx.translate(x, y); ctx.rotate(rotation);
-  ctx.fillStyle = palette.stub; ctx.fillRect(0, 0, w, h);
+  if (options.shadow) {
+    ctx.save();
+    ctx.globalAlpha = options.shadow;
+    ctx.fillStyle = 'rgba(0,0,0,.36)';
+    ctx.filter = 'blur(10px)';
+    ctx.translate(-14, 17);
+    if (options.torn) drawJaggedStubPath(ctx, w, h, options.bend || 0, options.tearProgress); else ctx.rect(0, 0, w, h);
+    ctx.fill();
+    ctx.restore();
+  }
+  ctx.fillStyle = palette.stub;
+  if (options.torn) {
+    drawJaggedStubPath(ctx, w, h, options.bend || 0, options.tearProgress);
+    ctx.fill();
+    ctx.save();
+    ctx.globalAlpha = .44;
+    ctx.strokeStyle = 'rgba(255,255,255,.58)';
+    ctx.lineWidth = 2.4;
+    ctx.beginPath();
+    for (let py = 4; py <= h - 4; py += 12) {
+      const tornHere = py <= h * Math.min(1, options.tearProgress ?? 1);
+      const px = tornHere ? (Math.floor(py / 12) % 2 ? 6 : -3) + Math.sin(py * .09) * 2 + Math.sin((py / h) * Math.PI) * (options.bend || 0) : 0;
+      if (py === 4) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+    ctx.restore();
+  } else {
+    ctx.fillRect(0, 0, w, h);
+  }
   ctx.fillStyle = palette.notch; ctx.beginPath(); ctx.arc(w, h / 2, 22, 0, Math.PI * 2); ctx.fill();
   ctx.fillStyle = '#f7f4e9'; ctx.font = 'bold 31px Arial';
   cityLines(state.city).split('<br>').forEach((line, i) => ctx.fillText(line, 19, 52 + i * 31));
@@ -645,26 +773,67 @@ function drawExportStub(ctx, x, y, w, h, rotation, palette) {
 }
 
 function drawExportTear(ctx, seamX, y, h, progress, palette) {
-  if (progress <= 0 || progress >= .98) return;
+  if (progress <= 0 || progress >= .96) return;
   ctx.save();
-  ctx.strokeStyle = 'rgba(247,241,226,.95)'; ctx.lineWidth = 3;
+  ctx.save();
+  ctx.globalAlpha = .12 + .24 * Math.sin(progress * Math.PI);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(seamX - 5, y, 14 + progress * 14, h);
+  ctx.restore();
+  ctx.strokeStyle = 'rgba(247,241,226,.97)'; ctx.lineWidth = 5;
   ctx.beginPath();
-  const visible = h * Math.min(1, progress * 1.7);
-  for (let py = 0; py <= visible; py += 8) {
-    const px = seamX + (Math.floor(py / 8) % 2 ? 4 : -3);
+  const visible = h * Math.min(1, progress);
+  for (let py = 0; py <= visible; py += 7) {
+    const px = seamX + (Math.floor(py / 7) % 2 ? 7 : -5) + Math.sin(py * .12 + progress * 7) * 2;
     if (py === 0) ctx.moveTo(px, y + py); else ctx.lineTo(px, y + py);
   }
   ctx.stroke();
-  const release = Math.max(0, (progress - .2) / .8);
-  ctx.fillStyle = 'rgba(238,229,210,.95)';
-  for (let i = 0; i < 9; i++) {
-    const phase = (i * .37 + release) % 1;
-    const px = seamX + 5 + release * (22 + i * 4);
-    const py = y + 18 + i * 23 + Math.sin(phase * 9) * 9;
-    ctx.save(); ctx.translate(px, py); ctx.rotate(release * 4 + i); ctx.fillRect(-3, -2, 7, 4); ctx.restore();
+  const release = easeOutCubic(Math.max(0, (progress - .15) / .85));
+  ctx.fillStyle = 'rgba(238,229,210,.98)';
+  for (let i = 0; i < 18; i++) {
+    const phase = (i * .31 + release) % 1;
+    const px = seamX + 4 + release * (34 + i * 5);
+    const py = y + 10 + i * 13 + Math.sin(phase * 11) * 13;
+    ctx.save(); ctx.translate(px, py); ctx.rotate(release * 5.6 + i * .7); ctx.fillRect(-4, -2, 10, 4); ctx.restore();
   }
   ctx.restore();
 }
+
+function drawExportRipFlash(ctx, seamX, y, h, progress) {
+  if (progress < .06 || progress > .92) return;
+  const head = y + Math.min(h, h * progress);
+  ctx.save();
+  ctx.globalAlpha = Math.sin(progress * Math.PI) * .42;
+  ctx.strokeStyle = 'rgba(255,255,255,.88)';
+  ctx.lineWidth = 2;
+  for (let i = 0; i < 7; i++) {
+    const yy = head - i * 13;
+    if (yy < y || yy > y + h) continue;
+    ctx.beginPath();
+    ctx.moveTo(seamX + 8, yy);
+    ctx.lineTo(seamX + 28 + i * 3, yy - 6 + Math.sin(i) * 5);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawExportTornEdge(ctx, seamX, y, h, alpha = .2) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = 'rgba(247,241,226,.9)';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  for (let py = 0; py <= h; py += 9) {
+    const px = seamX + (Math.floor(py / 9) % 2 ? 4 : -4);
+    if (py === 0) ctx.moveTo(px, y + py); else ctx.lineTo(px, y + py);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function lerp(a, b, p) { return a + (b - a) * p; }
+function easeInOutCubic(v) { return v < .5 ? 4 * v * v * v : 1 - Math.pow(-2 * v + 2, 3) / 2; }
+function easeOutCubic(v) { return 1 - Math.pow(1 - v, 3); }
 
 function samplePalette(source) {
   const canvas = document.createElement('canvas');
@@ -726,7 +895,7 @@ async function loadVisual(file) {
   }
 }
 
-async function prepareFramePicker(videoFile, fallbackImage) {
+async function prepareFramePicker(videoFile, fallbackImage, timeout = 15000) {
   const video = $('#cover-frame-video');
   if (fallbackImage) await setDraftCover(fallbackImage, true);
   if (state.frameVideoUrl) URL.revokeObjectURL(state.frameVideoUrl);
@@ -735,13 +904,13 @@ async function prepareFramePicker(videoFile, fallbackImage) {
   video.hidden = false;
   $('#frame-picker').hidden = false;
   video.load();
-  await waitForMedia(video, 'loadedmetadata', 15000);
+  await waitForMedia(video, 'loadedmetadata', timeout);
   if (!Number.isFinite(video.duration) || video.duration <= 0) throw new Error('Invalid video duration');
   const initialTime = Math.min(.5, video.duration * .15);
   $('#frame-range').value = String(Math.round((initialTime / video.duration) * 1000));
   $('#frame-time').textContent = formatTime(initialTime);
   video.currentTime = initialTime;
-  await waitForMedia(video, 'seeked', 15000);
+  await waitForMedia(video, 'seeked', timeout);
   const frame = await captureFrameElement(video);
   state.coverFile = frame;
   await setDraftCover(frame, true);
