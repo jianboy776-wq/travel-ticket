@@ -317,7 +317,11 @@ async function exportLive() {
   button.disabled = true;
   button.querySelector('strong').textContent = '正在生成安卓动态照片…';
   try {
-    const [still, result] = await Promise.all([renderTicketStill({live:true}), renderTicketVideo({live:true})]);
+    const nativeMp4 = typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported('video/mp4');
+    const [still, result] = await Promise.all([
+      renderTicketStill({live:true}),
+      nativeMp4 ? renderTicketVideo({live:true}) : renderTicketMp4WithWebCodecs()
+    ]);
     const base = safeName(state.city) + '-ticket';
     if (result.ext !== 'mp4') throw new Error('This browser cannot encode MP4 Motion Photo');
     const motionPhoto = await makeAndroidMotionPhoto(still, result.blob);
@@ -331,6 +335,47 @@ async function exportLive() {
     button.disabled = false;
     button.querySelector('strong').textContent = '安卓动态照片';
   }
+}
+
+async function renderTicketMp4WithWebCodecs() {
+  if (!('VideoEncoder' in window) || !('VideoFrame' in window)) throw new Error('WebCodecs H.264 encoding is unavailable');
+  const {Output, Mp4OutputFormat, BufferTarget, CanvasSource} = await import('https://cdn.jsdelivr.net/npm/mediabunny@1.50.2/+esm');
+  const canvas = document.createElement('canvas');
+  canvas.width = 720; canvas.height = 320;
+  const ctx = canvas.getContext('2d');
+  const cover = await loadVisual(state.coverFile);
+  const memoryImage = await loadVisual(state.imageFile || state.coverFile);
+  const palette = state.palette || samplePalette(cover);
+  let moving = null;
+  if (state.videoFile || state.motionBlob) {
+    moving = document.createElement('video');
+    moving.src = URL.createObjectURL(state.videoFile || state.motionBlob);
+    moving.muted = true; moving.playsInline = true; moving.loop = false;
+    await new Promise((resolve, reject) => { moving.onloadeddata = resolve; moving.onerror = reject; });
+  }
+
+  const target = new BufferTarget();
+  const output = new Output({format:new Mp4OutputFormat(), target});
+  const source = new CanvasSource(canvas, {codec:'avc', bitrate:3_000_000});
+  const fps = 24;
+  output.addVideoTrack(source, {frameRate:fps});
+  await output.start();
+  if (moving) { moving.currentTime = 0; await moving.play(); }
+  const started = performance.now();
+  const totalFrames = Math.ceil(5.6 * fps);
+  for (let frame = 0; frame <= totalFrames; frame++) {
+    const t = frame / fps;
+    const wait = started + t * 1000 - performance.now();
+    if (wait > 1) await new Promise(resolve => setTimeout(resolve, wait));
+    ctx.setTransform(1, 0, 0, 1, 0, -422);
+    drawExportFrame(ctx, t, cover, memoryImage, moving, palette);
+    await source.add(t, 1 / fps);
+  }
+  await output.finalize();
+  moving?.pause();
+  if (moving) URL.revokeObjectURL(moving.src);
+  if (!target.buffer) throw new Error('MP4 muxing failed');
+  return {blob:new Blob([target.buffer], {type:'video/mp4'}), ext:'mp4'};
 }
 
 async function exportAppleLive() {
