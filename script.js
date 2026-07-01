@@ -66,7 +66,17 @@ async function handleMemorySelection(files) {
     }
     state.coverFile = imageFile || null;
     const movingSource = videoFile || state.motionBlob;
-    if (movingSource) await prepareFramePicker(movingSource, imageFile);
+    if (movingSource) {
+      try {
+        await prepareFramePicker(movingSource, imageFile);
+      } catch (directError) {
+        $('#memory-label').textContent = '正在转换兼容格式…';
+        const compatibleVideo = await normalizeVideoForBrowser(movingSource);
+        if (videoFile) state.videoFile = compatibleVideo;
+        else state.motionBlob = compatibleVideo;
+        await prepareFramePicker(compatibleVideo, imageFile);
+      }
+    }
     else {
       hideFramePicker();
       await setDraftCover(imageFile);
@@ -80,6 +90,42 @@ async function handleMemorySelection(files) {
     $('#memory-label').textContent = '重新选择';
     showToast('无法读取该素材的定格画面，请换一个文件');
   }
+}
+
+async function normalizeVideoForBrowser(file) {
+  if (!('VideoDecoder' in window) || !('VideoEncoder' in window)) throw new Error('This browser cannot transcode the selected video');
+  const {
+    Input, Output, ALL_FORMATS, BlobSource, Mp4OutputFormat,
+    BufferTarget, Conversion
+  } = await import('https://cdn.jsdelivr.net/npm/mediabunny@1.50.2/+esm');
+  const input = new Input({formats:ALL_FORMATS, source:new BlobSource(file)});
+  if (!(await input.canRead())) throw new Error('Unsupported video container');
+  const track = await input.getPrimaryVideoTrack();
+  if (!track) throw new Error('No video track found');
+  const sourceWidth = await track.getDisplayWidth();
+  const target = new BufferTarget();
+  const output = new Output({format:new Mp4OutputFormat(), target});
+  const conversion = await Conversion.init({
+    input,
+    output,
+    video:{
+      codec:'avc',
+      bitrate:2_500_000,
+      width:Math.max(640, Math.min(sourceWidth || 1280, 1280)),
+      frameRate:30,
+      forceTranscode:true,
+      hardwareAcceleration:'no-preference'
+    },
+    audio:{discard:true},
+    tracks:'primary'
+  });
+  if (!conversion.isValid) throw new Error(`Video cannot be decoded: ${conversion.discardedTracks.map(item => item.reason).join(', ')}`);
+  conversion.onProgress = progress => {
+    $('#memory-label').textContent = `正在转换 ${Math.round(progress * 100)}%`;
+  };
+  await conversion.execute();
+  if (!target.buffer) throw new Error('Video conversion produced no output');
+  return new File([target.buffer], 'compatible-video.mp4', {type:'video/mp4'});
 }
 
 $('#frame-range').addEventListener('input', () => {
