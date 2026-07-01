@@ -41,6 +41,7 @@ $('#new-ticket').addEventListener('click', openEditor);
 $('#delete-ticket').addEventListener('click', deleteTicket);
 $('#download-ticket').addEventListener('click', () => openModal(downloadMenu));
 $('#export-live').addEventListener('click', exportLive);
+$('#export-apple-live').addEventListener('click', exportAppleLive);
 $('#export-video').addEventListener('click', exportVideo);
 document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => closeModal($('#' + button.dataset.close))));
 
@@ -314,24 +315,45 @@ async function exportLive() {
   if (!state.custom) return showToast('请先制作自己的票根');
   const button = $('#export-live');
   button.disabled = true;
-  button.querySelector('strong').textContent = '正在生成实况包…';
+  button.querySelector('strong').textContent = '正在生成安卓动态照片…';
   try {
-    const [still, result] = await Promise.all([renderTicketStill(), renderTicketVideo()]);
+    const [still, result] = await Promise.all([renderTicketStill({live:true}), renderTicketVideo({live:true})]);
     const base = safeName(state.city) + '-ticket';
-    const files = [
-      new File([still], `${base}-cover.jpg`, {type:'image/jpeg'}),
-      new File([result.blob], `${base}-motion.${result.ext}`, {type:result.blob.type})
-    ];
-    const bundle = await makeZip(files);
-    downloadBlob(bundle, `${base}-live-package.zip`);
+    if (result.ext !== 'mp4') throw new Error('This browser cannot encode MP4 Motion Photo');
+    const motionPhoto = await makeAndroidMotionPhoto(still, result.blob);
+    downloadBlob(motionPhoto, `${base}_MP.JPG`);
     closeModal(downloadMenu);
-    showToast('票根定格图和动态文件已打包');
+    showToast('安卓动态照片已生成，请保存后用系统相册打开');
   } catch (error) {
     console.error(error);
-    showToast('当前浏览器无法生成实况包');
+    showToast('当前浏览器无法编码安卓动态照片所需的 MP4');
   } finally {
     button.disabled = false;
-    button.querySelector('strong').textContent = '实况导出';
+    button.querySelector('strong').textContent = '安卓动态照片';
+  }
+}
+
+async function exportAppleLive() {
+  if (!state.custom) return showToast('请先制作自己的票根');
+  const button = $('#export-apple-live');
+  button.disabled = true;
+  button.querySelector('strong').textContent = '正在生成苹果实况素材…';
+  try {
+    const [still, result] = await Promise.all([renderTicketStill({live:true}), renderTicketVideo({live:true})]);
+    const base = safeName(state.city) + '-ticket';
+    const files = [
+      new File([still], `${base}-cover.JPG`, {type:'image/jpeg'}),
+      new File([result.blob], `${base}-motion.${result.ext}`, {type:result.blob.type})
+    ];
+    downloadBlob(await makeZip(files), `${base}-apple-live-assets.zip`);
+    closeModal(downloadMenu);
+    showToast('苹果素材包已生成；需通过支持 Live Photo 的工具导入相册');
+  } catch (error) {
+    console.error(error);
+    showToast('当前浏览器无法生成苹果实况素材');
+  } finally {
+    button.disabled = false;
+    button.querySelector('strong').textContent = '苹果实况素材';
   }
 }
 
@@ -354,12 +376,13 @@ async function exportVideo() {
   }
 }
 
-async function renderTicketVideo() {
+async function renderTicketVideo({live = false} = {}) {
   const canvas = document.createElement('canvas');
   const mobileExport = matchMedia('(pointer: coarse)').matches || innerWidth < 700;
-  canvas.width = mobileExport ? 540 : 720;
-  canvas.height = mobileExport ? 960 : 1280;
+  canvas.width = live ? 720 : (mobileExport ? 540 : 720);
+  canvas.height = live ? 405 : (mobileExport ? 960 : 1280);
   const renderScale = canvas.width / 720;
+  const cropTop = live ? 380 : 0;
   const ctx = canvas.getContext('2d');
   const cover = await loadVisual(state.coverFile);
   const memoryImage = await loadVisual(state.imageFile || state.coverFile);
@@ -384,7 +407,7 @@ async function renderTicketVideo() {
   await new Promise(resolve => {
     function frame(now) {
       const elapsed = (now - start) / 1000;
-      ctx.setTransform(renderScale, 0, 0, renderScale, 0, 0);
+      ctx.setTransform(renderScale, 0, 0, renderScale, 0, -cropTop * renderScale);
       drawExportFrame(ctx, elapsed, cover, memoryImage, moving, palette);
       if (elapsed < 5.6) requestAnimationFrame(frame); else resolve();
     }
@@ -397,12 +420,27 @@ async function renderTicketVideo() {
   return { blob: new Blob(chunks, { type: mime }), ext: mime.startsWith('video/mp4') ? 'mp4' : 'webm' };
 }
 
-async function renderTicketStill() {
+async function renderTicketStill({live = false} = {}) {
   const canvas = document.createElement('canvas');
-  canvas.width = 720; canvas.height = 1280;
+  canvas.width = 720; canvas.height = live ? 405 : 1280;
   const cover = await loadVisual(state.coverFile);
+  if (live) canvas.getContext('2d').setTransform(1, 0, 0, 1, 0, -380);
   drawExportFrame(canvas.getContext('2d'), 0, cover, cover, null, state.palette || samplePalette(cover));
   return new Promise((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('Still export failed')), 'image/jpeg', .94));
+}
+
+async function makeAndroidMotionPhoto(stillBlob, videoBlob) {
+  const videoLength = videoBlob.size;
+  const xmp = `http://ns.adobe.com/xap/1.0/\u0000<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Travel Stub"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:Camera="http://ns.google.com/photos/1.0/camera/" xmlns:GContainer="http://ns.google.com/photos/1.0/container/" xmlns:Item="http://ns.google.com/photos/1.0/container/item/" Camera:MotionPhoto="1" Camera:MotionPhotoVersion="1" Camera:MotionPhotoPresentationTimestampUs="-1"><GContainer:Directory><rdf:Seq><rdf:li rdf:parseType="Resource" Item:Mime="image/jpeg" Item:Semantic="Primary"/><rdf:li rdf:parseType="Resource" Item:Mime="video/mp4" Item:Semantic="MotionPhoto" Item:Length="${videoLength}"/></rdf:Seq></GContainer:Directory></rdf:Description></rdf:RDF></x:xmpmeta>`;
+  const xmpBytes = new TextEncoder().encode(xmp);
+  if (xmpBytes.length + 2 > 65535) throw new Error('XMP metadata is too large');
+  const app1 = new Uint8Array(4 + xmpBytes.length);
+  app1[0] = 0xff; app1[1] = 0xe1;
+  new DataView(app1.buffer).setUint16(2, xmpBytes.length + 2, false);
+  app1.set(xmpBytes, 4);
+  const jpeg = new Uint8Array(await stillBlob.arrayBuffer());
+  if (jpeg[0] !== 0xff || jpeg[1] !== 0xd8) throw new Error('Invalid JPEG still image');
+  return new Blob([jpeg.subarray(0, 2), app1, jpeg.subarray(2), videoBlob], {type:'image/jpeg'});
 }
 
 function drawExportFrame(ctx, t, cover, memoryImage, moving, palette) {
