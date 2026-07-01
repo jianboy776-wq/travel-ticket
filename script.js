@@ -7,6 +7,7 @@ const photo = $('#ticket-photo');
 const editor = $('#editor');
 const downloadMenu = $('#download-menu');
 const memoryInput = $('#memory-upload');
+const videoInput = $('#video-upload');
 const createButton = $('#create-ticket');
 const toast = $('#toast');
 let playbackResetTimer = null;
@@ -43,8 +44,11 @@ $('#export-live').addEventListener('click', exportLive);
 $('#export-video').addEventListener('click', exportVideo);
 document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => closeModal($('#' + button.dataset.close))));
 
-memoryInput.addEventListener('change', async () => {
-  state.memoryFiles = [...(memoryInput.files || [])];
+memoryInput.addEventListener('change', () => handleMemorySelection([...(memoryInput.files || [])]));
+videoInput.addEventListener('change', () => handleMemorySelection([...(videoInput.files || [])]));
+
+async function handleMemorySelection(files) {
+  state.memoryFiles = files;
   $('#memory-label').textContent = state.memoryFiles.length ? `${state.memoryFiles.length} 个文件` : '选择';
   if (!state.memoryFiles.length) return;
   const imageFile = state.memoryFiles.find(isImage) || null;
@@ -75,7 +79,7 @@ memoryInput.addEventListener('change', async () => {
     $('#memory-label').textContent = '重新选择';
     showToast('无法读取该素材的定格画面，请换一个文件');
   }
-});
+}
 
 $('#frame-range').addEventListener('input', () => {
   const video = $('#cover-frame-video');
@@ -298,6 +302,7 @@ function deleteTicket() {
   state.palette = null;
   resetTheme();
   memoryInput.value = '';
+  videoInput.value = '';
   $('#memory-label').textContent = '选择';
   hideFramePicker();
   ticketWrap.hidden = true;
