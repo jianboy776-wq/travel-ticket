@@ -67,14 +67,22 @@ async function handleMemorySelection(files) {
     state.coverFile = imageFile || null;
     const movingSource = videoFile || state.motionBlob;
     if (movingSource) {
-      try {
-        await prepareFramePicker(movingSource, imageFile);
-      } catch (directError) {
+      if (await isHevcVideoFile(movingSource)) {
         $('#memory-label').textContent = '正在转换兼容格式…';
         const compatibleVideo = await normalizeVideoForBrowser(movingSource);
         if (videoFile) state.videoFile = compatibleVideo;
         else state.motionBlob = compatibleVideo;
         await prepareFramePicker(compatibleVideo, imageFile);
+      } else {
+        try {
+          await prepareFramePicker(movingSource, imageFile);
+        } catch (directError) {
+          $('#memory-label').textContent = '正在转换兼容格式…';
+          const compatibleVideo = await normalizeVideoForBrowser(movingSource);
+          if (videoFile) state.videoFile = compatibleVideo;
+          else state.motionBlob = compatibleVideo;
+          await prepareFramePicker(compatibleVideo, imageFile);
+        }
       }
     }
     else {
@@ -87,13 +95,38 @@ async function handleMemorySelection(files) {
     showWizardStep('cover');
   } catch (error) {
     console.error(error);
+    window.__lastMediaError = String(error?.stack || error);
     $('#memory-label').textContent = '重新选择';
     showToast('无法读取该素材的定格画面，请换一个文件');
   }
 }
 
 async function normalizeVideoForBrowser(file) {
-  if (!('VideoDecoder' in window) || !('VideoEncoder' in window)) throw new Error('This browser cannot transcode the selected video');
+  if (await isHevcVideoFile(file)) return transcodeHevcWithFfmpeg(file);
+  try {
+    return await transcodeVideoWithWebCodecs(file);
+  } catch (webCodecsError) {
+    console.warn('Browser decoder could not read this video; using HEVC fallback.', webCodecsError);
+    return transcodeHevcWithFfmpeg(file);
+  }
+}
+
+async function isHevcVideoFile(file) {
+  const probeSize = Math.min(file.size, 8 * 1024 * 1024);
+  const parts = [file.slice(0, probeSize)];
+  if (file.size > probeSize) parts.push(file.slice(file.size - probeSize));
+  for (const part of parts) {
+    const bytes = new Uint8Array(await part.arrayBuffer());
+    for (let i = 0; i <= bytes.length - 4; i++) {
+      if ((bytes[i] === 0x68 && bytes[i + 1] === 0x76 && bytes[i + 2] === 0x63 && bytes[i + 3] === 0x31) ||
+          (bytes[i] === 0x68 && bytes[i + 1] === 0x65 && bytes[i + 2] === 0x76 && bytes[i + 3] === 0x31)) return true;
+    }
+  }
+  return false;
+}
+
+async function transcodeVideoWithWebCodecs(file) {
+  if (!('VideoDecoder' in window) || !('VideoEncoder' in window)) throw new Error('WebCodecs unavailable');
   const {
     Input, Output, ALL_FORMATS, BlobSource, Mp4OutputFormat,
     BufferTarget, Conversion
@@ -126,6 +159,45 @@ async function normalizeVideoForBrowser(file) {
   await conversion.execute();
   if (!target.buffer) throw new Error('Video conversion produced no output');
   return new File([target.buffer], 'compatible-video.mp4', {type:'video/mp4'});
+}
+
+async function transcodeHevcWithFfmpeg(file) {
+  $('#memory-label').textContent = '正在加载 H.265 读取组件…';
+  const [{FFmpeg}, {toBlobURL}] = await Promise.all([
+    import('./vendor/ffmpeg/index.js'),
+    import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js')
+  ]);
+  const ffmpeg = new FFmpeg();
+  const coreBase = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm';
+  ffmpeg.on('progress', ({progress}) => {
+    const percent = Math.max(0, Math.min(99, Math.round(progress * 100)));
+    $('#memory-label').textContent = `正在转换 H.265 视频 ${percent}%`;
+  });
+  await ffmpeg.load({
+    coreURL: await toBlobURL(`${coreBase}/ffmpeg-core.js`, 'text/javascript'),
+    wasmURL: await toBlobURL(`${coreBase}/ffmpeg-core.wasm`, 'application/wasm')
+  });
+  const inputName = 'selected-hevc.mp4';
+  const outputName = 'compatible-video.mp4';
+  await ffmpeg.writeFile(inputName, new Uint8Array(await file.arrayBuffer()));
+  const exitCode = await ffmpeg.exec([
+    '-i', inputName,
+    '-map', '0:v:0',
+    '-vf', 'scale=min(1280\\,iw):-2',
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-crf', '25',
+    '-pix_fmt', 'yuv420p',
+    '-movflags', '+faststart',
+    '-an', outputName
+  ]);
+  if (exitCode !== 0) throw new Error(`HEVC conversion failed (${exitCode})`);
+  const bytes = await ffmpeg.readFile(outputName);
+  const stableBytes = new Uint8Array(bytes.length);
+  stableBytes.set(bytes);
+  ffmpeg.terminate();
+  if (!stableBytes.length) throw new Error('HEVC conversion produced no output');
+  return new File([stableBytes.buffer], outputName, {type:'video/mp4'});
 }
 
 $('#frame-range').addEventListener('input', () => {
