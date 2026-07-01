@@ -46,11 +46,14 @@
 
       <div class="wizard-step" id="media-step">
         <p class="step-title"><b>01</b><span>先选择想保存的回忆</span></p>
-        <label class="field upload-field hero-upload">
-          <span class="field-copy"><strong>选择实况、视频或照片</strong><small>安卓选原始动态照片；iPhone 可同时选择照片＋MOV</small></span>
-          <input id="memory-upload" type="file" accept="image/*,video/*,.heic,.heif,.avif,.mov,.mp4" multiple />
-          <span class="pick" id="memory-label">选择回忆</span>
-        </label>
+        <div class="field hero-upload memory-chooser">
+          <span class="field-copy"><strong>选择回忆类型</strong><small>照片与视频使用独立入口，避免手机相册过滤视频</small></span>
+          <div class="memory-picks">
+            <label class="pick"><input id="memory-upload" type="file" accept="image/*,.heic,.heif,.avif" multiple /><span>选择照片 / 实况</span></label>
+            <label class="pick video-pick"><input id="video-upload" type="file" accept="video/*" /><span>选择视频</span></label>
+          </div>
+          <span class="chosen-file" id="memory-label">尚未选择</span>
+        </div>
         <p class="privacy">选好回忆后，下一步才会进入票根封面设计。</p>
       </div>
 
