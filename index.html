@@ -58,7 +58,12 @@
         <button class="wizard-back" id="back-to-media" type="button">← 重新选择回忆</button>
         <p class="step-title"><b>02</b><span>调整票根封面</span></p>
         <div class="cover-designer">
-          <div class="cover-preview" id="cover-preview"><div class="preview-blur"></div><img id="cover-preview-image" alt="票根封面预览" /></div>
+          <div class="cover-preview" id="cover-preview"><div class="preview-blur"></div><img id="cover-preview-image" alt="票根封面预览" /><video id="cover-frame-video" muted playsinline preload="metadata" hidden></video></div>
+          <div class="frame-picker" id="frame-picker" hidden>
+            <div><span>选择实况封面帧</span><b id="frame-time">0:00</b></div>
+            <input id="frame-range" type="range" min="0" max="1000" value="0" aria-label="拖动选择实况封面帧" />
+            <small>拖动时间轴，画面停在哪里，哪里就是票根封面。</small>
+          </div>
           <div class="layout-modes" role="group" aria-label="封面排版方式">
             <button class="active" type="button" data-cover-mode="fill"><strong>裁切填满</strong><small>长条效果更强</small></button>
             <button type="button" data-cover-mode="fit"><strong>完整显示</strong><small>模糊背景补齐</small></button>
