@@ -380,9 +380,9 @@ async function renderTicketVideo({live = false} = {}) {
   const canvas = document.createElement('canvas');
   const mobileExport = matchMedia('(pointer: coarse)').matches || innerWidth < 700;
   canvas.width = live ? 720 : (mobileExport ? 540 : 720);
-  canvas.height = live ? 405 : (mobileExport ? 960 : 1280);
+  canvas.height = live ? 320 : (mobileExport ? 960 : 1280);
   const renderScale = canvas.width / 720;
-  const cropTop = live ? 380 : 0;
+  const cropTop = live ? 422 : 0;
   const ctx = canvas.getContext('2d');
   const cover = await loadVisual(state.coverFile);
   const memoryImage = await loadVisual(state.imageFile || state.coverFile);
@@ -422,9 +422,9 @@ async function renderTicketVideo({live = false} = {}) {
 
 async function renderTicketStill({live = false} = {}) {
   const canvas = document.createElement('canvas');
-  canvas.width = 720; canvas.height = live ? 405 : 1280;
+  canvas.width = 720; canvas.height = live ? 320 : 1280;
   const cover = await loadVisual(state.coverFile);
-  if (live) canvas.getContext('2d').setTransform(1, 0, 0, 1, 0, -380);
+  if (live) canvas.getContext('2d').setTransform(1, 0, 0, 1, 0, -422);
   drawExportFrame(canvas.getContext('2d'), 0, cover, cover, null, state.palette || samplePalette(cover));
   return new Promise((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('Still export failed')), 'image/jpeg', .94));
 }
