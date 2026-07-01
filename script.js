@@ -356,7 +356,10 @@ async function exportVideo() {
 
 async function renderTicketVideo() {
   const canvas = document.createElement('canvas');
-  canvas.width = 720; canvas.height = 1280;
+  const mobileExport = matchMedia('(pointer: coarse)').matches || innerWidth < 700;
+  canvas.width = mobileExport ? 540 : 720;
+  canvas.height = mobileExport ? 960 : 1280;
+  const renderScale = canvas.width / 720;
   const ctx = canvas.getContext('2d');
   const cover = await loadVisual(state.coverFile);
   const memoryImage = await loadVisual(state.imageFile || state.coverFile);
@@ -371,7 +374,7 @@ async function renderTicketVideo() {
   }
   const mime = ['video/mp4','video/webm;codecs=vp9','video/webm'].find(type => MediaRecorder.isTypeSupported(type));
   if (!mime) throw new Error('MediaRecorder unsupported');
-  const recorder = new MediaRecorder(canvas.captureStream(30), { mimeType: mime, videoBitsPerSecond: 5_000_000 });
+  const recorder = new MediaRecorder(canvas.captureStream(mobileExport ? 24 : 30), { mimeType: mime, videoBitsPerSecond: mobileExport ? 3_000_000 : 5_000_000 });
   const chunks = [];
   recorder.ondataavailable = event => event.data.size && chunks.push(event.data);
   const done = new Promise(resolve => recorder.onstop = resolve);
@@ -381,8 +384,9 @@ async function renderTicketVideo() {
   await new Promise(resolve => {
     function frame(now) {
       const elapsed = (now - start) / 1000;
+      ctx.setTransform(renderScale, 0, 0, renderScale, 0, 0);
       drawExportFrame(ctx, elapsed, cover, memoryImage, moving, palette);
-      if (elapsed < 5.2) requestAnimationFrame(frame); else resolve();
+      if (elapsed < 5.6) requestAnimationFrame(frame); else resolve();
     }
     requestAnimationFrame(frame);
   });
@@ -403,27 +407,62 @@ async function renderTicketStill() {
 
 function drawExportFrame(ctx, t, cover, memoryImage, moving, palette) {
   const W = 720, H = 1280, x = 54, y = 460, w = 612, h = 245, stubW = 154;
-  const intact = t < 1.3 || t >= 4.45;
+  const intact = t < 1.05 || t >= 4.7;
+  const tearProgress = Math.max(0, Math.min(1, (t - 1.05) / 1.15));
+  const revealProgress = Math.max(0, Math.min(1, (t - 2.12) / .48));
   ctx.fillStyle = palette.background; ctx.fillRect(0, 0, W, H);
   ctx.save(); roundedPath(ctx, x, y, w, h, 13); ctx.clip();
-  if (intact) {
+  if (intact || t < 2.6) {
     drawCrop(ctx, cover, x, y, w - stubW, h, 1);
-  } else {
-    const zoom = 1 + Math.min(.08, Math.max(0, t - 2.1) * .018);
-    drawCrop(ctx, moving && moving.readyState >= 2 ? moving : memoryImage, x, y, w, h, zoom);
+  }
+  if (!intact && t >= 2.12) {
+    ctx.globalAlpha = revealProgress;
+    drawCrop(ctx, moving && moving.readyState >= 2 ? moving : memoryImage, x, y, w, h, 1);
+    ctx.globalAlpha = 1;
   }
   ctx.restore();
-  if (intact || t < 2.15) {
-    const p = intact ? 0 : Math.max(0, Math.min(1, (t - 1.25) / .9));
-    const sx = x + w - stubW + p * (stubW + 70);
-    ctx.save(); ctx.translate(sx, y + Math.sin(p * Math.PI) * 7); ctx.rotate(p * .12);
-    ctx.fillStyle = palette.stub; ctx.fillRect(0, 0, stubW, h);
-    ctx.fillStyle = '#f7f4e9'; ctx.font = 'bold 31px Arial';
-    cityLines(state.city).split('<br>').forEach((line, i) => ctx.fillText(line, 19, 52 + i * 31));
-    ctx.font = 'bold 17px Arial'; ctx.fillText(state.date, 19, 151);
-    ctx.globalAlpha = .75; ctx.font = 'bold 10px Arial'; ctx.fillText('NO.848620', 19, 186); ctx.fillText('TRAVELSTUB', 19, 206);
-    ctx.restore();
+  if (intact) drawExportStub(ctx, x + w - stubW, y, stubW, h, 0, palette);
+  else if (t < 2.35) {
+    const resistance = tearProgress < .3 ? Math.sin(tearProgress * 46) * 7 : 0;
+    const release = Math.max(0, (tearProgress - .28) / .72);
+    const sx = x + w - stubW + resistance + release * (stubW + 105);
+    drawExportStub(ctx, sx, y + Math.sin(release * Math.PI) * 12 + release * 24, stubW, h, release * .28, palette);
+    drawExportTear(ctx, x + w - stubW, y, h, tearProgress, palette);
   }
+}
+
+function drawExportStub(ctx, x, y, w, h, rotation, palette) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rotation);
+  ctx.fillStyle = palette.stub; ctx.fillRect(0, 0, w, h);
+  ctx.fillStyle = palette.notch; ctx.beginPath(); ctx.arc(w, h / 2, 22, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#f7f4e9'; ctx.font = 'bold 31px Arial';
+  cityLines(state.city).split('<br>').forEach((line, i) => ctx.fillText(line, 19, 52 + i * 31));
+  ctx.font = 'bold 17px Arial'; ctx.fillText(state.date, 19, 151);
+  ctx.globalAlpha = .75; ctx.font = 'bold 10px Arial'; ctx.fillText('NO.848620', 19, 186); ctx.fillText('TRAVELSTUB', 19, 206);
+  for (let i = 0; i < 9; i++) ctx.fillRect(20 + i * 11, 218, i % 3 === 0 ? 5 : 3, 19);
+  ctx.restore();
+}
+
+function drawExportTear(ctx, seamX, y, h, progress, palette) {
+  if (progress <= 0 || progress >= .98) return;
+  ctx.save();
+  ctx.strokeStyle = 'rgba(247,241,226,.95)'; ctx.lineWidth = 3;
+  ctx.beginPath();
+  const visible = h * Math.min(1, progress * 1.7);
+  for (let py = 0; py <= visible; py += 8) {
+    const px = seamX + (Math.floor(py / 8) % 2 ? 4 : -3);
+    if (py === 0) ctx.moveTo(px, y + py); else ctx.lineTo(px, y + py);
+  }
+  ctx.stroke();
+  const release = Math.max(0, (progress - .2) / .8);
+  ctx.fillStyle = 'rgba(238,229,210,.95)';
+  for (let i = 0; i < 9; i++) {
+    const phase = (i * .37 + release) % 1;
+    const px = seamX + 5 + release * (22 + i * 4);
+    const py = y + 18 + i * 23 + Math.sin(phase * 9) * 9;
+    ctx.save(); ctx.translate(px, py); ctx.rotate(release * 4 + i); ctx.fillRect(-3, -2, 7, 4); ctx.restore();
+  }
+  ctx.restore();
 }
 
 function samplePalette(source) {
