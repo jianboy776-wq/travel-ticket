@@ -23,6 +23,7 @@ const state = {
   memoryUrl: null,
   videoUrl: null,
   draftCoverUrl: null,
+  frameVideoUrl: null,
   coverMode: 'fill',
   coverX: 50,
   coverY: 50,
@@ -48,14 +49,24 @@ memoryInput.addEventListener('change', async () => {
   if (!state.memoryFiles.length) return;
   const imageFile = state.memoryFiles.find(isImage) || null;
   const videoFile = state.memoryFiles.find(isVideo) || null;
+  state.imageFile = imageFile;
+  state.videoFile = videoFile;
+  state.motionBlob = null;
+  state.androidMotion = false;
   $('#memory-label').textContent = '正在读取…';
   try {
-    state.coverFile = imageFile || (videoFile ? await captureVideoFrame(videoFile) : null);
+    if (!videoFile && imageFile) {
+      state.motionBlob = await extractAndroidMotionVideo(imageFile);
+      state.androidMotion = Boolean(state.motionBlob);
+    }
+    state.coverFile = imageFile || null;
+    const movingSource = videoFile || state.motionBlob;
+    if (movingSource) await prepareFramePicker(movingSource, imageFile);
+    else {
+      hideFramePicker();
+      await setDraftCover(imageFile);
+    }
     if (!state.coverFile) throw new Error('No usable cover frame');
-    if (state.draftCoverUrl) URL.revokeObjectURL(state.draftCoverUrl);
-    state.draftCoverUrl = URL.createObjectURL(state.coverFile);
-    $('#cover-preview-image').src = state.draftCoverUrl;
-    $('.preview-blur').style.backgroundImage = `url("${state.draftCoverUrl}")`;
     resetCoverDesign();
     $('#memory-label').textContent = `${state.memoryFiles.length} 个文件`;
     showWizardStep('cover');
@@ -63,6 +74,23 @@ memoryInput.addEventListener('change', async () => {
     console.error(error);
     $('#memory-label').textContent = '重新选择';
     showToast('无法读取该素材的定格画面，请换一个文件');
+  }
+});
+
+$('#frame-range').addEventListener('input', () => {
+  const video = $('#cover-frame-video');
+  if (!Number.isFinite(video.duration) || !video.duration) return;
+  video.currentTime = (Number($('#frame-range').value) / 1000) * video.duration;
+  $('#frame-time').textContent = formatTime(video.currentTime);
+});
+
+$('#cover-frame-video').addEventListener('seeked', async () => {
+  try {
+    const file = await captureFrameElement($('#cover-frame-video'));
+    state.coverFile = file;
+    await setDraftCover(file, true);
+  } catch (error) {
+    console.warn('Frame capture failed', error);
   }
 });
 
@@ -108,7 +136,7 @@ function resetCoverDesign() {
 
 function updateCoverPreview() {
   const preview = $('#cover-preview');
-  const image = $('#cover-preview-image');
+  const image = $('#cover-frame-video').hidden ? $('#cover-preview-image') : $('#cover-frame-video');
   preview.classList.toggle('fit', state.coverMode === 'fit');
   image.style.objectPosition = `${state.coverX}% ${state.coverY}%`;
   image.style.transform = coverTransform();
@@ -131,12 +159,10 @@ function showWizardStep(step) {
 
 async function buildTicket() {
   revokeUrls();
-  state.imageFile = state.memoryFiles.find(isImage) || null;
-  state.videoFile = state.memoryFiles.find(isVideo) || null;
-  state.motionBlob = null;
-  state.androidMotion = false;
+  state.imageFile = state.imageFile || state.memoryFiles.find(isImage) || null;
+  state.videoFile = state.videoFile || state.memoryFiles.find(isVideo) || null;
 
-  if (!state.videoFile && state.imageFile) {
+  if (!state.videoFile && state.imageFile && !state.motionBlob) {
     state.motionBlob = await extractAndroidMotionVideo(state.imageFile);
     state.androidMotion = Boolean(state.motionBlob);
   }
@@ -273,6 +299,7 @@ function deleteTicket() {
   resetTheme();
   memoryInput.value = '';
   $('#memory-label').textContent = '选择';
+  hideFramePicker();
   ticketWrap.hidden = true;
   empty.hidden = false;
   showToast('票根已删除');
@@ -454,6 +481,70 @@ async function loadVisual(file) {
   }
 }
 
+async function prepareFramePicker(videoFile, fallbackImage) {
+  const video = $('#cover-frame-video');
+  if (fallbackImage) await setDraftCover(fallbackImage, true);
+  if (state.frameVideoUrl) URL.revokeObjectURL(state.frameVideoUrl);
+  state.frameVideoUrl = URL.createObjectURL(videoFile);
+  video.src = state.frameVideoUrl;
+  video.hidden = false;
+  $('#frame-picker').hidden = false;
+  video.load();
+  await waitForMedia(video, 'loadedmetadata', 15000);
+  if (!Number.isFinite(video.duration) || video.duration <= 0) throw new Error('Invalid video duration');
+  const initialTime = Math.min(.5, video.duration * .15);
+  $('#frame-range').value = String(Math.round((initialTime / video.duration) * 1000));
+  $('#frame-time').textContent = formatTime(initialTime);
+  video.currentTime = initialTime;
+  await waitForMedia(video, 'seeked', 15000);
+  const frame = await captureFrameElement(video);
+  state.coverFile = frame;
+  await setDraftCover(frame, true);
+}
+
+function waitForMedia(media, event, timeout) {
+  if (event === 'loadedmetadata' && media.readyState >= 1) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${event} timeout`)), timeout);
+    const done = () => { clearTimeout(timer); media.removeEventListener('error', failed); resolve(); };
+    const failed = () => { clearTimeout(timer); media.removeEventListener(event, done); reject(new Error('Video format is not supported')); };
+    media.addEventListener(event, done, {once:true});
+    media.addEventListener('error', failed, {once:true});
+  });
+}
+
+async function captureFrameElement(video) {
+  if (!video.videoWidth || !video.videoHeight) throw new Error('Video frame unavailable');
+  const canvas = document.createElement('canvas');
+  canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+  canvas.getContext('2d').drawImage(video, 0, 0);
+  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', .94));
+  if (!blob) throw new Error('Frame capture failed');
+  return new File([blob], 'selected-live-cover.jpg', {type:'image/jpeg'});
+}
+
+async function setDraftCover(file, keepVideo = false) {
+  if (!file) return;
+  if (state.draftCoverUrl) URL.revokeObjectURL(state.draftCoverUrl);
+  state.draftCoverUrl = URL.createObjectURL(file);
+  $('#cover-preview-image').src = state.draftCoverUrl;
+  $('.preview-blur').style.backgroundImage = `url("${state.draftCoverUrl}")`;
+  if (!keepVideo) $('#cover-frame-video').hidden = true;
+}
+
+function hideFramePicker() {
+  const video = $('#cover-frame-video');
+  video.pause(); video.removeAttribute('src'); video.load(); video.hidden = true;
+  $('#frame-picker').hidden = true;
+  if (state.frameVideoUrl) URL.revokeObjectURL(state.frameVideoUrl);
+  state.frameVideoUrl = null;
+}
+
+function formatTime(seconds) {
+  const value = Math.max(0, Math.floor(seconds || 0));
+  return `${Math.floor(value / 60)}:${String(value % 60).padStart(2, '0')}`;
+}
+
 async function captureVideoFrame(file) {
   const url = URL.createObjectURL(file);
   const video = document.createElement('video');
@@ -523,4 +614,4 @@ function openModal(el){el.hidden=false;document.body.style.overflow='hidden';}
 function closeModal(el){el.hidden=true;document.body.style.overflow='';}
 function showToast(message){toast.textContent=message;toast.classList.add('show');clearTimeout(showToast.timer);showToast.timer=setTimeout(()=>toast.classList.remove('show'),2800);}
 function downloadBlob(blob,name){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1500);}
-function revokeUrls(){['coverUrl','memoryUrl','videoUrl','draftCoverUrl'].forEach(key=>{if(state[key])URL.revokeObjectURL(state[key]);state[key]=null;});}
+function revokeUrls(){['coverUrl','memoryUrl','videoUrl','draftCoverUrl','frameVideoUrl'].forEach(key=>{if(state[key])URL.revokeObjectURL(state[key]);state[key]=null;});}
