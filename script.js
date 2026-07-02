@@ -15,7 +15,7 @@ let playbackResetTimer = null;
 let pageTurnPreviewFrame = 0;
 let pageTurnFramesPromise = null;
 let pageTurnFrames = [];
-const TICKET_TEAR_SECONDS = 1;
+const TICKET_TEAR_SECONDS = .72;
 const TICKET_OUTRO_SECONDS = .28;
 const PHOTO_PLAY_SECONDS = 7.6;
 const EXPORT_TICKET_Y = 356;
@@ -54,7 +54,6 @@ $('#export-live').addEventListener('click', exportLive);
 $('#export-apple-live').addEventListener('click', exportAppleLive);
 $('#export-video').addEventListener('click', exportVideo);
 document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => closeModal($('#' + button.dataset.close))));
-setTimeout(() => ensurePageTurnFrames(), 0);
 
 memoryInput.addEventListener('change', () => handleMemorySelection([...(memoryInput.files || [])]));
 videoInput.addEventListener('change', () => handleMemorySelection([...(videoInput.files || [])]));
@@ -354,14 +353,9 @@ async function buildTicket() {
   resetTicket();
 }
 
-async function openTicket() {
-  if (ticket.classList.contains('open') || ticket.classList.contains('tearing') || ticket.classList.contains('preparing-turn')) return;
-  ticket.classList.add('preparing-turn');
-  await ensurePageTurnFrames();
-  ticket.classList.remove('preparing-turn');
+function openTicket() {
   if (ticket.classList.contains('open') || ticket.classList.contains('tearing')) return;
   ticket.classList.add('tearing');
-  startPageTurnPreview();
   createTearParticles();
   playTearSound();
   if (navigator.vibrate) navigator.vibrate([24, 28, 18, 20, 10]);
@@ -535,7 +529,6 @@ async function renderTicketMp4WithWebCodecs({live = false} = {}) {
   const cover = await loadVisual(state.coverFile);
   const memoryImage = await loadVisual(state.imageFile || state.coverFile);
   const palette = state.palette || samplePalette(cover);
-  await ensurePageTurnFrames();
   let moving = null;
   if (state.videoFile || state.motionBlob) {
     moving = document.createElement('video');
@@ -632,7 +625,6 @@ async function renderTicketVideo({live = false} = {}) {
   const cover = await loadVisual(state.coverFile);
   const memoryImage = await loadVisual(state.imageFile || state.coverFile);
   const palette = state.palette || samplePalette(cover);
-  await ensurePageTurnFrames();
   let moving = null;
   if (state.videoFile || state.motionBlob) {
     moving = document.createElement('video');
@@ -713,9 +705,9 @@ function drawExportFrame(ctx, t, cover, memoryImage, moving, palette, suppliedTi
   const intact = t < tearStart || t >= resetAt;
   const tearLinear = Math.max(0, Math.min(1, (t - tearStart) / tearDuration));
   const stubPose = exportTearPose(tearLinear, stubW);
-  const revealProgress = easeOutCubic(Math.max(0, Math.min(1, (t - contentStart) / .45)));
+  const revealProgress = t >= contentStart ? 1 : 0;
   ctx.fillStyle = palette.background; ctx.fillRect(0, 0, W, H);
-  if (!intact && t < contentStart + .45) {
+  if (!intact && t < contentStart) {
     ctx.save();
     ctx.globalAlpha = .14 * Math.sin(tearLinear * Math.PI);
     ctx.fillStyle = '#000';
@@ -724,7 +716,7 @@ function drawExportFrame(ctx, t, cover, memoryImage, moving, palette, suppliedTi
     ctx.restore();
   }
   ctx.save(); roundedPath(ctx, x, y, w, h, 13); ctx.clip();
-  if (intact || t < contentStart + .45) {
+  if (intact || t < contentStart) {
     drawCrop(ctx, cover, x, y, w - stubW, h, 1);
   }
   if (!intact && t >= contentStart) {
@@ -734,39 +726,28 @@ function drawExportFrame(ctx, t, cover, memoryImage, moving, palette, suppliedTi
   }
   ctx.restore();
   if (intact) drawExportStub(ctx, x + w - stubW, y, stubW, h, 0, palette);
-  else if (t < contentStart + .45) {
+  else if (t < contentStart) {
     drawExportTear(ctx, x + w - stubW, y, h, tearLinear, palette);
-    const pageTurnBlend = pageTurnFrames.length ? smoothstep(.28, .48, tearLinear) : 0;
-    if (pageTurnBlend < 1) {
-      ctx.save(); ctx.globalAlpha = 1 - pageTurnBlend;
-      drawExportStub(ctx, x + w - stubW + stubPose.x, y + stubPose.y, stubW, h, stubPose.rotation, palette, {
-        torn: tearLinear > .18,
-        tearProgress: tearLinear,
-        shadow: .28 + stubPose.release * .48,
-        bend: Math.sin(Math.min(1, tearLinear) * Math.PI) * 9
-      });
-      ctx.restore();
-    }
-    if (pageTurnBlend > 0) {
-      const image = pageTurnFrames[Math.min(pageTurnFrames.length - 1, Math.floor(tearLinear * pageTurnFrames.length))];
-      drawTintedPageFrame(ctx, image, x + w - stubW + stubPose.x, y + stubPose.y, stubW, h, stubPose.rotation, palette, pageTurnBlend);
-    }
+    drawExportStub(ctx, x + w - stubW + stubPose.x, y + stubPose.y, stubW, h, stubPose.rotation, palette, {
+      torn: tearLinear > .30,
+      tearProgress: tearLinear,
+      shadow: .18 + stubPose.release * .30,
+      bend: Math.sin(Math.min(1, tearLinear) * Math.PI) * 4
+    });
     drawExportRipFlash(ctx, x + w - stubW, y, h, tearLinear);
-  } else if (t < resetAt) {
-    drawExportTornEdge(ctx, x + w - stubW, y, h, .18);
   }
 }
 
 function exportTearPose(p, stubW) {
-  const release = easeOutCubic(Math.max(0, (p - .42) / .58));
+  const release = easeOutCubic(Math.max(0, (p - .48) / .52));
   const cssLike = [
     {p:0, x:0, y:0, r:0},
-    {p:.14, x:-5, y:0, r:-1},
-    {p:.28, x:8, y:-3, r:1},
-    {p:.43, x:-2, y:3, r:-1.5},
-    {p:.58, x:23, y:-2, r:3},
-    {p:.72, x:52, y:9, r:6},
-    {p:1, x:stubW * 1.45, y:69, r:19}
+    {p:.20, x:-4, y:0, r:-.6},
+    {p:.38, x:7, y:-2, r:.8},
+    {p:.52, x:1, y:1, r:-.8},
+    {p:.68, x:31, y:-1, r:3},
+    {p:.82, x:78, y:7, r:7},
+    {p:1, x:stubW * 1.35, y:31, r:12}
   ];
   let a = cssLike[0], b = cssLike[cssLike.length - 1];
   for (let i = 0; i < cssLike.length - 1; i++) {
@@ -776,7 +757,7 @@ function exportTearPose(p, stubW) {
   }
   const local = a === b ? 1 : easeInOutCubic((p - a.p) / Math.max(.001, b.p - a.p));
   return {
-    x: lerp(a.x, b.x, local) + (1 - release) * Math.sin(p * 78) * 8,
+    x: lerp(a.x, b.x, local) + (1 - release) * Math.sin(p * 46) * 3,
     y: lerp(a.y, b.y, local),
     rotation: lerp(a.r, b.r, local) * Math.PI / 180,
     release
@@ -844,7 +825,8 @@ function drawExportTear(ctx, seamX, y, h, progress, palette) {
   ctx.fillStyle = '#000';
   ctx.fillRect(seamX - 5, y, 14 + progress * 14, h);
   ctx.restore();
-  ctx.strokeStyle = 'rgba(247,241,226,.97)'; ctx.lineWidth = 5;
+  ctx.globalAlpha = .68;
+  ctx.strokeStyle = 'rgba(247,241,226,.92)'; ctx.lineWidth = 2.2;
   ctx.beginPath();
   const visible = h * Math.min(1, progress);
   for (let py = 0; py <= visible; py += 7) {
