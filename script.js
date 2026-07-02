@@ -13,8 +13,6 @@ const toast = $('#toast');
 const pageTurnCanvas = $('#page-turn-overlay');
 let playbackResetTimer = null;
 let pageTurnPreviewFrame = 0;
-let pageTurnFramesPromise = null;
-let pageTurnFrames = [];
 const TICKET_TEAR_SECONDS = .72;
 const TICKET_OUTRO_SECONDS = .28;
 const PHOTO_PLAY_SECONDS = 7.6;
@@ -353,9 +351,21 @@ async function buildTicket() {
   resetTicket();
 }
 
-function openTicket() {
-  if (ticket.classList.contains('open') || ticket.classList.contains('tearing')) return;
+async function openTicket() {
+  if (ticket.classList.contains('open') || ticket.classList.contains('tearing') || ticket.classList.contains('preparing-turn')) return;
+  let sharedRenderer = null;
+  if (state.custom && state.coverFile) {
+    ticket.classList.add('preparing-turn');
+    try {
+      sharedRenderer = await createTicketAnimationRenderer(memory.querySelector('video'));
+    } catch (error) {
+      console.warn('Shared ticket preview unavailable; using the DOM fallback.', error);
+    } finally {
+      ticket.classList.remove('preparing-turn');
+    }
+  }
   ticket.classList.add('tearing');
+  if (sharedRenderer) startPageTurnPreview(sharedRenderer);
   createTearParticles();
   playTearSound();
   if (navigator.vibrate) navigator.vibrate([24, 28, 18, 20, 10]);
@@ -423,48 +433,27 @@ function resetTicket() {
   ticket.classList.remove('open', 'tearing', 'closing');
   cancelAnimationFrame(pageTurnPreviewFrame);
   pageTurnCanvas.getContext('2d').clearRect(0, 0, pageTurnCanvas.width, pageTurnCanvas.height);
+  pageTurnCanvas.classList.remove('shared-preview');
   $('#stub').style.opacity = '';
   memory.setAttribute('aria-hidden', 'true');
 }
 
-function ensurePageTurnFrames() {
-  if (pageTurnFrames.length) return Promise.resolve(pageTurnFrames);
-  if (!pageTurnFramesPromise) {
-    pageTurnFramesPromise = Promise.all(Array.from({length:30}, (_, index) => new Promise((resolve, reject) => {
-      const image = new Image();
-      image.onload = () => resolve(image);
-      image.onerror = reject;
-      image.src = `assets/page-turn/turn-${String(index).padStart(2, '0')}.png`;
-    }))).then(images => (pageTurnFrames = images)).catch(error => {
-      console.warn('AE page-turn frames unavailable; using the built-in fallback.', error);
-      pageTurnFramesPromise = null;
-      return [];
-    });
-  }
-  return pageTurnFramesPromise;
-}
-
-function startPageTurnPreview() {
+function startPageTurnPreview(renderer) {
   cancelAnimationFrame(pageTurnPreviewFrame);
-  ensurePageTurnFrames().then(frames => {
-    if (!frames.length || !ticket.classList.contains('tearing')) return;
-    const ctx = pageTurnCanvas.getContext('2d');
-    const started = performance.now();
-    const stubElement = $('#stub');
-    function frame(now) {
-      const p = Math.max(0, Math.min(1, (now - started) / (TICKET_TEAR_SECONDS * 1000)));
-      const blend = smoothstep(.28, .48, p);
-      ctx.clearRect(0, 0, 1080, 432);
-      stubElement.style.opacity = String(1 - blend);
-      if (blend > 0) {
-        const pose = exportTearPose(p, 270);
-        const image = frames[Math.min(frames.length - 1, Math.floor(p * frames.length))];
-        drawTintedPageFrame(ctx, image, 810 + pose.x, pose.y * 1.55, 270, 432, pose.rotation, state.palette || {stub:'#496c78'}, blend);
-      }
-      if (p < 1 && ticket.classList.contains('tearing')) pageTurnPreviewFrame = requestAnimationFrame(frame);
+  const ctx = pageTurnCanvas.getContext('2d');
+  const started = performance.now();
+  pageTurnCanvas.classList.add('shared-preview');
+  function frame(now) {
+    const elapsed = (now - started) / 1000;
+    if (!ticket.classList.contains('tearing') || elapsed >= TICKET_TEAR_SECONDS) {
+      ctx.clearRect(0, 0, pageTurnCanvas.width, pageTurnCanvas.height);
+      pageTurnCanvas.classList.remove('shared-preview');
+      return;
     }
+    renderer.drawTicketPreview(ctx, elapsed);
     pageTurnPreviewFrame = requestAnimationFrame(frame);
-  });
+  }
+  pageTurnPreviewFrame = requestAnimationFrame(frame);
 }
 
 function deleteTicket() {
@@ -544,6 +533,7 @@ async function renderTicketMp4WithWebCodecs({live = false} = {}) {
   output.addVideoTrack(source, {frameRate:fps});
   await output.start();
   const timeline = getExportTimeline(moving);
+  const renderer = new TicketAnimationRenderer({cover, memoryImage, moving, palette, timeline});
   if (moving) { moving.pause(); moving.currentTime = 0; }
   let movingStarted = false;
   const started = performance.now();
@@ -558,7 +548,7 @@ async function renderTicketMp4WithWebCodecs({live = false} = {}) {
       movingStarted = true;
     }
     ctx.setTransform(renderScale, 0, 0, renderScale, 0, -cropTop * renderScale);
-    drawExportFrame(ctx, t, cover, memoryImage, moving, palette, timeline);
+    renderer.draw(ctx, t);
     await source.add(t, 1 / fps);
   }
   await output.finalize();
@@ -635,6 +625,7 @@ async function renderTicketVideo({live = false} = {}) {
     moving.currentTime = 0;
   }
   const timeline = getExportTimeline(moving);
+  const renderer = new TicketAnimationRenderer({cover, memoryImage, moving, palette, timeline});
   const mime = ['video/mp4','video/webm;codecs=vp9','video/webm'].find(type => MediaRecorder.isTypeSupported(type));
   if (!mime) throw new Error('MediaRecorder unsupported');
   const recorder = new MediaRecorder(canvas.captureStream(mobileExport ? 24 : 30), { mimeType: mime, videoBitsPerSecond: mobileExport ? 3_000_000 : 5_000_000 });
@@ -654,7 +645,7 @@ async function renderTicketVideo({live = false} = {}) {
         movingStarted = true;
       }
       ctx.setTransform(renderScale, 0, 0, renderScale, 0, -cropTop * renderScale);
-      drawExportFrame(ctx, elapsed, cover, memoryImage, moving, palette, timeline);
+      renderer.draw(ctx, elapsed);
       if (elapsed < timeline.total) requestAnimationFrame(frame); else resolve();
     }
     requestAnimationFrame(frame);
@@ -696,6 +687,40 @@ function getExportTimeline(moving) {
   const contentStart = TICKET_TEAR_SECONDS;
   const resetAt = contentStart + mediaDuration;
   return {tearStart:0, tearDuration:TICKET_TEAR_SECONDS, contentStart, mediaDuration, resetAt, total:resetAt + TICKET_OUTRO_SECONDS};
+}
+
+class TicketAnimationRenderer {
+  constructor({cover, memoryImage, moving, palette, timeline = null}) {
+    this.cover = cover;
+    this.memoryImage = memoryImage;
+    this.moving = moving;
+    this.palette = palette;
+    this.timeline = timeline || getExportTimeline(moving);
+    this.previewSurface = document.createElement('canvas');
+    this.previewSurface.width = 720;
+    this.previewSurface.height = 1280;
+    this.previewContext = this.previewSurface.getContext('2d');
+  }
+
+  draw(ctx, time) {
+    drawExportFrame(ctx, time, this.cover, this.memoryImage, this.moving, this.palette, this.timeline);
+  }
+
+  drawTicketPreview(ctx, time) {
+    this.previewContext.setTransform(1, 0, 0, 1, 0, 0);
+    this.previewContext.clearRect(0, 0, 720, 1280);
+    this.draw(this.previewContext, time);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, 1080, 432);
+    ctx.drawImage(this.previewSurface, 54, EXPORT_TICKET_Y, 612, 245, 0, 0, 1080, 432);
+  }
+}
+
+async function createTicketAnimationRenderer(moving = null) {
+  const cover = await loadVisual(state.coverFile);
+  const memoryImage = await loadVisual(state.imageFile || state.coverFile);
+  const palette = state.palette || samplePalette(cover);
+  return new TicketAnimationRenderer({cover, memoryImage, moving, palette});
 }
 
 function drawExportFrame(ctx, t, cover, memoryImage, moving, palette, suppliedTimeline = null) {
