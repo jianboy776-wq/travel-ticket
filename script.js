@@ -48,8 +48,6 @@ $('#edit-ticket').addEventListener('click', openEditor);
 $('#new-ticket').addEventListener('click', openEditor);
 $('#delete-ticket').addEventListener('click', deleteTicket);
 $('#download-ticket').addEventListener('click', () => openModal(downloadMenu));
-$('#export-live').addEventListener('click', exportLive);
-$('#export-apple-live').addEventListener('click', exportAppleLive);
 $('#export-video').addEventListener('click', exportVideo);
 document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => closeModal($('#' + button.dataset.close))));
 
@@ -366,7 +364,7 @@ async function openTicket() {
   }
   ticket.classList.add('tearing');
   if (sharedRenderer) startPageTurnPreview(sharedRenderer);
-  createTearParticles();
+  else createTearParticles();
   playTearSound();
   if (navigator.vibrate) navigator.vibrate([24, 28, 18, 20, 10]);
   setTimeout(() => {
@@ -381,17 +379,28 @@ async function openTicket() {
 
 function createTearParticles() {
   ticket.querySelectorAll('.tear-particle').forEach(piece => piece.remove());
+  const random = seededRandom(848620);
   for (let i = 0; i < 12; i++) {
     const piece = document.createElement('i');
     piece.className = 'tear-particle';
-    piece.style.setProperty('--y', `${8 + Math.random() * 84}%`);
-    piece.style.setProperty('--s', `${4 + Math.random() * 7}px`);
-    piece.style.setProperty('--delay', `${.18 + Math.random() * .35}s`);
-    piece.style.setProperty('--drift', `${Math.random() * 30}px`);
-    piece.style.setProperty('--fall', `${Math.random() * 40 - 15}px`);
+    piece.style.setProperty('--y', `${8 + random() * 84}%`);
+    piece.style.setProperty('--s', `${4 + random() * 7}px`);
+    piece.style.setProperty('--delay', `${.18 + random() * .35}s`);
+    piece.style.setProperty('--drift', `${random() * 30}px`);
+    piece.style.setProperty('--fall', `${random() * 40 - 15}px`);
     ticket.appendChild(piece);
     setTimeout(() => piece.remove(), 1300);
   }
+}
+
+function seededRandom(seed) {
+  return () => {
+    seed |= 0;
+    seed = seed + 0x6D2B79F5 | 0;
+    let value = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    value = value + Math.imul(value ^ value >>> 7, 61 | value) ^ value;
+    return ((value ^ value >>> 14) >>> 0) / 4294967296;
+  };
 }
 
 function playTearSound() {
@@ -445,10 +454,15 @@ function startPageTurnPreview(renderer) {
   pageTurnCanvas.classList.add('shared-preview');
   function frame(now) {
     const elapsed = (now - started) / 1000;
-    if (!ticket.classList.contains('tearing') || elapsed >= TICKET_TEAR_SECONDS) {
+    const active = ticket.classList.contains('tearing') || ticket.classList.contains('open') || ticket.classList.contains('closing');
+    if (!active || elapsed >= renderer.timeline.total) {
       ctx.clearRect(0, 0, pageTurnCanvas.width, pageTurnCanvas.height);
       pageTurnCanvas.classList.remove('shared-preview');
       return;
+    }
+    if (renderer.moving && elapsed >= renderer.timeline.contentStart && elapsed < renderer.timeline.resetAt) {
+      const expected = Math.min(renderer.timeline.mediaDuration, elapsed - renderer.timeline.contentStart);
+      if (Math.abs(renderer.moving.currentTime - expected) > .12) renderer.moving.currentTime = expected;
     }
     renderer.drawTicketPreview(ctx, elapsed);
     pageTurnPreviewFrame = requestAnimationFrame(frame);
@@ -512,9 +526,8 @@ async function renderTicketMp4WithWebCodecs({live = false} = {}) {
   const mobileExport = matchMedia('(pointer: coarse)').matches || innerWidth < 700;
   canvas.width = live ? 720 : (mobileExport ? 540 : 720);
   canvas.height = live ? 320 : (mobileExport ? 960 : 1280);
-  const renderScale = canvas.width / 720;
-  const cropTop = live ? LIVE_CROP_TOP : 0;
   const ctx = canvas.getContext('2d');
+  await waitForTicketAssets();
   const cover = await loadVisual(state.coverFile);
   const memoryImage = await loadVisual(state.imageFile || state.coverFile);
   const palette = state.palette || samplePalette(cover);
@@ -535,20 +548,13 @@ async function renderTicketMp4WithWebCodecs({live = false} = {}) {
   const timeline = getExportTimeline(moving);
   const renderer = new TicketAnimationRenderer({cover, memoryImage, moving, palette, timeline});
   if (moving) { moving.pause(); moving.currentTime = 0; }
-  let movingStarted = false;
-  const started = performance.now();
   const totalFrames = Math.floor(timeline.total * fps);
   for (let frame = 0; frame < totalFrames; frame++) {
     const t = frame / fps;
-    const wait = started + t * 1000 - performance.now();
-    if (wait > 1) await new Promise(resolve => setTimeout(resolve, wait));
-    if (moving && !movingStarted && t >= timeline.contentStart) {
-      moving.currentTime = 0;
-      await moving.play();
-      movingStarted = true;
+    if (moving && t >= timeline.contentStart && t < timeline.resetAt) {
+      await seekVideoForFrame(moving, Math.min(timeline.mediaDuration, t - timeline.contentStart));
     }
-    ctx.setTransform(renderScale, 0, 0, renderScale, 0, -cropTop * renderScale);
-    renderer.draw(ctx, t);
+    renderer.drawOutput(ctx, t, {live});
     await source.add(t, 1 / fps);
   }
   await output.finalize();
@@ -591,7 +597,7 @@ async function exportVideo() {
   button.disabled = true;
   button.querySelector('strong').textContent = '正在生成视频…';
   try {
-    const result = 'VideoEncoder' in window ? await renderTicketMp4WithWebCodecs() : await renderTicketVideo();
+    const result = await renderPreferredTicketVideo();
     downloadBlob(result.blob, safeName(state.city) + '-ticket.' + result.ext);
     closeModal(downloadMenu);
     showToast('票根视频已生成');
@@ -600,8 +606,19 @@ async function exportVideo() {
     showToast('当前浏览器无法生成视频，请换用 Chrome 或 Safari');
   } finally {
     button.disabled = false;
-    button.querySelector('strong').textContent = '视频导出';
+    button.querySelector('strong').textContent = '下载视频';
   }
+}
+
+async function renderPreferredTicketVideo() {
+  if ('VideoEncoder' in window && 'VideoFrame' in window) {
+    try {
+      return await renderTicketMp4WithWebCodecs();
+    } catch (error) {
+      console.warn('WebCodecs export failed; using MediaRecorder fallback.', error);
+    }
+  }
+  return renderTicketVideo();
 }
 
 async function renderTicketVideo({live = false} = {}) {
@@ -609,9 +626,8 @@ async function renderTicketVideo({live = false} = {}) {
   const mobileExport = matchMedia('(pointer: coarse)').matches || innerWidth < 700;
   canvas.width = live ? 720 : (mobileExport ? 540 : 720);
   canvas.height = live ? 320 : (mobileExport ? 960 : 1280);
-  const renderScale = canvas.width / 720;
-  const cropTop = live ? LIVE_CROP_TOP : 0;
   const ctx = canvas.getContext('2d');
+  await waitForTicketAssets();
   const cover = await loadVisual(state.coverFile);
   const memoryImage = await loadVisual(state.imageFile || state.coverFile);
   const palette = state.palette || samplePalette(cover);
@@ -644,8 +660,7 @@ async function renderTicketVideo({live = false} = {}) {
         moving.play().catch(() => {});
         movingStarted = true;
       }
-      ctx.setTransform(renderScale, 0, 0, renderScale, 0, -cropTop * renderScale);
-      renderer.draw(ctx, elapsed);
+      renderer.drawOutput(ctx, elapsed, {live});
       if (elapsed < timeline.total) requestAnimationFrame(frame); else resolve();
     }
     requestAnimationFrame(frame);
@@ -696,38 +711,73 @@ class TicketAnimationRenderer {
     this.moving = moving;
     this.palette = palette;
     this.timeline = timeline || getExportTimeline(moving);
-    this.previewSurface = document.createElement('canvas');
-    this.previewSurface.width = 720;
-    this.previewSurface.height = 1280;
-    this.previewContext = this.previewSurface.getContext('2d');
+    this.canonicalSurface = document.createElement('canvas');
+    this.canonicalSurface.width = 720;
+    this.canonicalSurface.height = 1280;
+    this.canonicalContext = this.canonicalSurface.getContext('2d');
+    this.seed = 848620;
   }
 
-  draw(ctx, time) {
-    drawExportFrame(ctx, time, this.cover, this.memoryImage, this.moving, this.palette, this.timeline);
+  renderCanonical(time) {
+    this.canonicalContext.setTransform(1, 0, 0, 1, 0, 0);
+    this.canonicalContext.clearRect(0, 0, 720, 1280);
+    drawExportFrame(this.canonicalContext, time, this.cover, this.memoryImage, this.moving, this.palette, this.timeline);
+    return this.canonicalSurface;
+  }
+
+  drawOutput(ctx, time, {live = false} = {}) {
+    const surface = this.renderCanonical(time);
+    const width = ctx.canvas.width;
+    const height = ctx.canvas.height;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    if (live) ctx.drawImage(surface, 0, LIVE_CROP_TOP, 720, 320, 0, 0, width, height);
+    else ctx.drawImage(surface, 0, 0, 720, 1280, 0, 0, width, height);
   }
 
   drawTicketPreview(ctx, time) {
-    this.previewContext.setTransform(1, 0, 0, 1, 0, 0);
-    this.previewContext.clearRect(0, 0, 720, 1280);
-    this.draw(this.previewContext, time);
+    const surface = this.renderCanonical(time);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, 1080, 432);
-    ctx.drawImage(this.previewSurface, 54, EXPORT_TICKET_Y, 612, 245, 0, 0, 1080, 432);
+    ctx.drawImage(surface, 54, EXPORT_TICKET_Y, 612, 245, 0, 0, 1080, 432);
   }
 }
 
 async function createTicketAnimationRenderer(moving = null) {
+  await waitForTicketAssets(moving);
   const cover = await loadVisual(state.coverFile);
   const memoryImage = await loadVisual(state.imageFile || state.coverFile);
   const palette = state.palette || samplePalette(cover);
   return new TicketAnimationRenderer({cover, memoryImage, moving, palette});
 }
 
+async function waitForTicketAssets(moving = null) {
+  if (document.fonts?.ready) await document.fonts.ready;
+  if (moving && moving.readyState < 2) {
+    await new Promise((resolve, reject) => {
+      moving.addEventListener('loadeddata', resolve, {once:true});
+      moving.addEventListener('error', reject, {once:true});
+    });
+  }
+}
+
+async function seekVideoForFrame(video, time) {
+  const target = Math.max(0, Math.min(Math.max(0, video.duration - .001), time));
+  video.pause();
+  if (Math.abs(video.currentTime - target) < .0005 && video.readyState >= 2) return;
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Video frame seek timed out')), 5000);
+    const done = () => { clearTimeout(timer); resolve(); };
+    video.addEventListener('seeked', done, {once:true});
+    video.currentTime = target;
+  });
+}
+
 function drawExportFrame(ctx, t, cover, memoryImage, moving, palette, suppliedTimeline = null) {
   const W = 720, H = 1280, x = 54, y = EXPORT_TICKET_Y, w = 612, h = 245, stubW = 154;
   const timeline = suppliedTimeline || getExportTimeline(moving);
   const {tearStart, tearDuration, contentStart, resetAt} = timeline;
-  const intact = t < tearStart || t >= resetAt;
+  const intact = t <= tearStart || t >= resetAt;
   const tearLinear = Math.max(0, Math.min(1, (t - tearStart) / tearDuration));
   const stubPose = exportTearPose(tearLinear, stubW);
   const revealProgress = t >= contentStart ? 1 : 0;
