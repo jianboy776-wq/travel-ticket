@@ -54,6 +54,7 @@ $('#export-live').addEventListener('click', exportLive);
 $('#export-apple-live').addEventListener('click', exportAppleLive);
 $('#export-video').addEventListener('click', exportVideo);
 document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => closeModal($('#' + button.dataset.close))));
+setTimeout(() => ensurePageTurnFrames(), 0);
 
 memoryInput.addEventListener('change', () => handleMemorySelection([...(memoryInput.files || [])]));
 videoInput.addEventListener('change', () => handleMemorySelection([...(videoInput.files || [])]));
@@ -353,7 +354,11 @@ async function buildTicket() {
   resetTicket();
 }
 
-function openTicket() {
+async function openTicket() {
+  if (ticket.classList.contains('open') || ticket.classList.contains('tearing') || ticket.classList.contains('preparing-turn')) return;
+  ticket.classList.add('preparing-turn');
+  await ensurePageTurnFrames();
+  ticket.classList.remove('preparing-turn');
   if (ticket.classList.contains('open') || ticket.classList.contains('tearing')) return;
   ticket.classList.add('tearing');
   startPageTurnPreview();

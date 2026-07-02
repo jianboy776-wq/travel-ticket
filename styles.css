@@ -9,3 +9,4 @@
 @media(prefers-reduced-motion:reduce){.ticket.tearing .stub,.ticket.open .memory,.ticket.open .progress i{animation-duration:.01ms!important;animation-delay:0s!important}}
 .ticket:not(.tearing) .tear-edge{opacity:0}.ticket.tearing .tear-edge{opacity:1}
 .page-turn-overlay{position:absolute;inset:0;z-index:9;width:100%;height:100%;pointer-events:none}.ticket:not(.tearing) .page-turn-overlay{display:none}
+.ticket.preparing-turn .stub{animation:prepareTurn .55s ease-in-out infinite alternate}@keyframes prepareTurn{to{transform:translateX(4px);filter:brightness(1.08)}}
