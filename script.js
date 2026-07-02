@@ -13,14 +13,22 @@ const toast = $('#toast');
 const pageTurnCanvas = $('#page-turn-overlay');
 let playbackResetTimer = null;
 let pageTurnPreviewFrame = 0;
-const TICKET_TEAR_SECONDS = .72;
+let activeTicketRenderer = null;
+let idleRenderToken = 0;
+const TICKET_TEAR_SECONDS = 1.45;
 const TICKET_OUTRO_SECONDS = .28;
 const PHOTO_PLAY_SECONDS = 7.6;
-const EXPORT_TICKET_Y = 356;
-const LIVE_CROP_TOP = 318;
+const RENDER_WIDTH = 1280;
+const RENDER_HEIGHT = 720;
+const RENDER_TICKET_X = 80;
+const RENDER_TICKET_Y = 136;
+const RENDER_TICKET_WIDTH = 1120;
+const RENDER_TICKET_HEIGHT = 448;
+const RENDER_STUB_WIDTH = 280;
 const TICKET_ANIMATION_SEED = 848620;
 let ffmpegRuntimePromise = null;
 let defaultTicketVisualPromise = null;
+let activeBackdropSurface = null;
 
 const state = {
   custom: false,
@@ -52,6 +60,9 @@ $('#delete-ticket').addEventListener('click', deleteTicket);
 $('#download-ticket').addEventListener('click', () => openModal(downloadMenu));
 $('#export-video').addEventListener('click', exportVideo);
 document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => closeModal($('#' + button.dataset.close))));
+applyDefaultStageBackdrop()
+  .then(() => showIdleTicketPreview())
+  .catch(error => console.warn('Default ticket preview unavailable.', error));
 
 memoryInput.addEventListener('change', () => handleMemorySelection([...(memoryInput.files || [])]));
 videoInput.addEventListener('change', () => handleMemorySelection([...(videoInput.files || [])]));
@@ -316,6 +327,7 @@ async function buildTicket() {
   const paletteSource = await loadVisual(state.coverFile);
   state.palette = samplePalette(paletteSource);
   applyTheme(state.palette);
+  applyStageBackdrop(paletteSource, state.palette);
 
   photo.style.backgroundImage = `url("${state.coverUrl}")`;
   photo.classList.add('custom');
@@ -348,15 +360,21 @@ async function buildTicket() {
   $('#ticket-date').textContent = state.date;
   ticketWrap.hidden = false;
   empty.hidden = true;
+  activeTicketRenderer = null;
   resetTicket();
 }
 
 async function openTicket() {
   if (ticket.classList.contains('open') || ticket.classList.contains('tearing') || ticket.classList.contains('preparing-turn')) return;
-  let sharedRenderer = null;
+  idleRenderToken++;
+  pageTurnCanvas.classList.remove('idle-preview');
+  let sharedRenderer = activeTicketRenderer;
   ticket.classList.add('preparing-turn');
   try {
-    sharedRenderer = await createTicketAnimationRenderer(memory.querySelector('video'));
+    if (!sharedRenderer || sharedRenderer.moving !== memory.querySelector('video')) {
+      sharedRenderer = await createTicketAnimationRenderer(memory.querySelector('video'));
+      activeTicketRenderer = sharedRenderer;
+    }
   } catch (error) {
     console.warn('Shared ticket preview unavailable; using the DOM fallback.', error);
   } finally {
@@ -389,7 +407,7 @@ function createTearParticles() {
     piece.style.setProperty('--drift', `${random() * 30}px`);
     piece.style.setProperty('--fall', `${random() * 40 - 15}px`);
     ticket.appendChild(piece);
-    setTimeout(() => piece.remove(), 1300);
+    setTimeout(() => piece.remove(), 1900);
   }
 }
 
@@ -407,7 +425,7 @@ function playTearSound() {
   const AudioContext = window.AudioContext || window.webkitAudioContext;
   if (!AudioContext) return;
   const context = new AudioContext();
-  const duration = .72;
+  const duration = TICKET_TEAR_SECONDS;
   const buffer = context.createBuffer(1, context.sampleRate * duration, context.sampleRate);
   const data = buffer.getChannelData(0);
   for (let i = 0; i < data.length; i++) {
@@ -442,15 +460,26 @@ function resetTicket() {
   ticket.classList.remove('open', 'tearing', 'closing', 'preparing-turn', 'canvas-tear-active');
   cancelAnimationFrame(pageTurnPreviewFrame);
   pageTurnCanvas.getContext('2d').clearRect(0, 0, pageTurnCanvas.width, pageTurnCanvas.height);
-  pageTurnCanvas.classList.remove('shared-preview');
+  pageTurnCanvas.classList.remove('shared-preview', 'idle-preview');
   $('#stub').style.opacity = '';
   memory.setAttribute('aria-hidden', 'true');
+  if (!ticketWrap.hidden) showIdleTicketPreview().catch(error => console.warn('Idle ticket preview unavailable.', error));
+}
+
+async function showIdleTicketPreview() {
+  const token = ++idleRenderToken;
+  const renderer = await createTicketAnimationRenderer(memory.querySelector('video'));
+  if (token !== idleRenderToken || ticket.classList.contains('tearing') || ticket.classList.contains('open')) return;
+  activeTicketRenderer = renderer;
+  renderer.drawTicketPreview(pageTurnCanvas.getContext('2d'), 0);
+  pageTurnCanvas.classList.add('idle-preview');
 }
 
 function startPageTurnPreview(renderer) {
   cancelAnimationFrame(pageTurnPreviewFrame);
   const ctx = pageTurnCanvas.getContext('2d');
   const started = performance.now();
+  pageTurnCanvas.classList.remove('idle-preview');
   ticket.classList.add('canvas-tear-active');
   pageTurnCanvas.classList.add('shared-preview');
   function frame(now) {
@@ -479,6 +508,10 @@ function deleteTicket() {
     return;
   }
   resetTicket();
+  idleRenderToken++;
+  activeTicketRenderer = null;
+  pageTurnCanvas.classList.remove('idle-preview');
+  pageTurnCanvas.getContext('2d').clearRect(0, 0, pageTurnCanvas.width, pageTurnCanvas.height);
   revokeUrls();
   state.custom = false;
   state.coverFile = null;
@@ -486,6 +519,7 @@ function deleteTicket() {
   state.imageFile = state.videoFile = state.motionBlob = null;
   state.palette = null;
   resetTheme();
+  applyDefaultStageBackdrop().catch(error => console.warn('Default backdrop unavailable.', error));
   memoryInput.value = '';
   videoInput.value = '';
   $('#memory-label').textContent = '选择';
@@ -526,8 +560,8 @@ async function renderTicketMp4WithWebCodecs({live = false} = {}) {
   const {Output, Mp4OutputFormat, BufferTarget, CanvasSource} = await import('https://cdn.jsdelivr.net/npm/mediabunny@1.50.2/+esm');
   const canvas = document.createElement('canvas');
   const mobileExport = matchMedia('(pointer: coarse)').matches || innerWidth < 700;
-  canvas.width = live ? 720 : (mobileExport ? 540 : 720);
-  canvas.height = live ? 320 : (mobileExport ? 960 : 1280);
+  canvas.width = RENDER_WIDTH;
+  canvas.height = RENDER_HEIGHT;
   const ctx = canvas.getContext('2d');
   await waitForTicketAssets();
   const cover = await loadVisual(state.coverFile);
@@ -626,8 +660,8 @@ async function renderPreferredTicketVideo() {
 async function renderTicketVideo({live = false} = {}) {
   const canvas = document.createElement('canvas');
   const mobileExport = matchMedia('(pointer: coarse)').matches || innerWidth < 700;
-  canvas.width = live ? 720 : (mobileExport ? 540 : 720);
-  canvas.height = live ? 320 : (mobileExport ? 960 : 1280);
+  canvas.width = RENDER_WIDTH;
+  canvas.height = RENDER_HEIGHT;
   const ctx = canvas.getContext('2d');
   await waitForTicketAssets();
   const cover = await loadVisual(state.coverFile);
@@ -676,10 +710,9 @@ async function renderTicketVideo({live = false} = {}) {
 
 async function renderTicketStill({live = false} = {}) {
   const canvas = document.createElement('canvas');
-  canvas.width = 720; canvas.height = live ? 320 : 1280;
+  canvas.width = RENDER_WIDTH; canvas.height = RENDER_HEIGHT;
   const cover = await loadVisual(state.coverFile);
-  if (live) canvas.getContext('2d').setTransform(1, 0, 0, 1, 0, -LIVE_CROP_TOP);
-  drawExportFrame(canvas.getContext('2d'), 0, cover, cover, null, state.palette || samplePalette(cover));
+  drawExportFrame(canvas.getContext('2d'), 0, cover, cover, null, state.palette || samplePalette(cover), null, getCurrentCoverLayout());
   return new Promise((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('Still export failed')), 'image/jpeg', .94));
 }
 
@@ -715,16 +748,21 @@ class TicketAnimationRenderer {
     this.coverLayout = coverLayout || {mode:'fill', x:50, y:50, zoom:100};
     this.timeline = timeline || getExportTimeline(moving);
     this.canonicalSurface = document.createElement('canvas');
-    this.canonicalSurface.width = 720;
-    this.canonicalSurface.height = 1280;
+    this.canonicalSurface.width = RENDER_WIDTH;
+    this.canonicalSurface.height = RENDER_HEIGHT;
     this.canonicalContext = this.canonicalSurface.getContext('2d');
+    this.backdropSurface = document.createElement('canvas');
+    this.backdropSurface.width = RENDER_WIDTH;
+    this.backdropSurface.height = RENDER_HEIGHT;
+    if (activeBackdropSurface) this.backdropSurface.getContext('2d').drawImage(activeBackdropSurface, 0, 0);
+    else drawTicketAtmosphere(this.backdropSurface.getContext('2d'), this.cover, this.palette, RENDER_WIDTH, RENDER_HEIGHT);
     this.seed = TICKET_ANIMATION_SEED;
   }
 
   renderCanonical(time) {
     this.canonicalContext.setTransform(1, 0, 0, 1, 0, 0);
-    this.canonicalContext.clearRect(0, 0, 720, 1280);
-    drawExportFrame(this.canonicalContext, time, this.cover, this.memoryImage, this.moving, this.palette, this.timeline, this.coverLayout, this.seed);
+    this.canonicalContext.clearRect(0, 0, RENDER_WIDTH, RENDER_HEIGHT);
+    drawExportFrame(this.canonicalContext, time, this.cover, this.memoryImage, this.moving, this.palette, this.timeline, this.coverLayout, this.seed, this.backdropSurface);
     return this.canonicalSurface;
   }
 
@@ -734,15 +772,14 @@ class TicketAnimationRenderer {
     const height = ctx.canvas.height;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, width, height);
-    if (live) ctx.drawImage(surface, 0, LIVE_CROP_TOP, 720, 320, 0, 0, width, height);
-    else ctx.drawImage(surface, 0, 0, 720, 1280, 0, 0, width, height);
+    ctx.drawImage(surface, 0, 0, RENDER_WIDTH, RENDER_HEIGHT, 0, 0, width, height);
   }
 
   drawTicketPreview(ctx, time) {
     const surface = this.renderCanonical(time);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, 1080, 432);
-    ctx.drawImage(surface, 54, EXPORT_TICKET_Y, 612, 245, 0, 0, 1080, 432);
+    ctx.drawImage(surface, RENDER_TICKET_X, RENDER_TICKET_Y, RENDER_TICKET_WIDTH, RENDER_TICKET_HEIGHT, 0, 0, 1080, 432);
   }
 }
 
@@ -810,15 +847,23 @@ async function seekVideoForFrame(video, time) {
   });
 }
 
-function drawExportFrame(ctx, t, cover, memoryImage, moving, palette, suppliedTimeline = null, coverLayout = null, seed = TICKET_ANIMATION_SEED) {
-  const W = 720, H = 1280, x = 54, y = EXPORT_TICKET_Y, w = 612, h = 245, stubW = 154;
+function drawExportFrame(ctx, t, cover, memoryImage, moving, palette, suppliedTimeline = null, coverLayout = null, seed = TICKET_ANIMATION_SEED, backdrop = null) {
+  const W = RENDER_WIDTH, H = RENDER_HEIGHT, x = RENDER_TICKET_X, y = RENDER_TICKET_Y, w = RENDER_TICKET_WIDTH, h = RENDER_TICKET_HEIGHT, stubW = RENDER_STUB_WIDTH;
   const timeline = suppliedTimeline || getExportTimeline(moving);
   const {tearStart, tearDuration, contentStart, resetAt} = timeline;
   const intact = t <= tearStart || t >= resetAt;
   const tearLinear = Math.max(0, Math.min(1, (t - tearStart) / tearDuration));
   const stubPose = exportTearPose(tearLinear, stubW);
   const revealProgress = t >= contentStart ? 1 : 0;
-  ctx.fillStyle = palette.background; ctx.fillRect(0, 0, W, H);
+  if (backdrop) ctx.drawImage(backdrop, 0, 0, W, H);
+  else drawTicketAtmosphere(ctx, cover, palette, W, H);
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,.28)';
+  ctx.shadowBlur = 38;
+  ctx.shadowOffsetY = 18;
+  ctx.fillStyle = 'rgba(0,0,0,.12)';
+  roundedPath(ctx, x, y, w, h, 24); ctx.fill();
+  ctx.restore();
   ctx.save(); roundedPath(ctx, x, y, w, h, 13); ctx.clip();
   if (intact || t < contentStart) {
     const tug = !intact && t < Math.min(contentStart, .44) ? -2 * Math.sin((t / .22) * Math.PI) : 0;
@@ -830,7 +875,7 @@ function drawExportFrame(ctx, t, cover, memoryImage, moving, palette, suppliedTi
     ctx.globalAlpha = 1;
   }
   ctx.restore();
-  if (intact) drawExportStub(ctx, x + w - stubW, y, stubW, h, 0, palette);
+  if (intact) drawExportStub(ctx, x + w - stubW, y, stubW, h, 0, palette, {perforated:true});
   else if (t < contentStart) {
     drawReferenceTear(ctx, x + w - stubW, y, h, tearLinear, palette, seed);
     drawExportStub(ctx, x + w - stubW + stubPose.x, y + stubPose.y, stubW, h, stubPose.rotation, palette, {
@@ -897,10 +942,13 @@ function drawExportStub(ctx, x, y, w, h, rotation, palette, options = {}) {
   ctx.fillRect(0, 0, w, h);
   if (options.perforated) {
     ctx.save();
-    ctx.strokeStyle = 'rgba(247,241,226,.72)';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([5, 6]);
-    ctx.beginPath(); ctx.moveTo(1, 0); ctx.lineTo(1, h); ctx.stroke();
+    for (let py = 8; py < h; py += 16) {
+      ctx.fillStyle = 'rgba(4,18,20,.72)';
+      ctx.beginPath(); ctx.arc(0, py, 5.4, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = 'rgba(247,241,226,.72)';
+      ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.arc(0, py, 5.4, -.72, .72); ctx.stroke();
+    }
     ctx.restore();
   }
   ctx.fillStyle = palette.notch; ctx.beginPath(); ctx.arc(w, h / 2, 22, 0, Math.PI * 2); ctx.fill();
@@ -1040,6 +1088,46 @@ function applyTheme(palette) {
   root.setProperty('--bg', palette.background);
   root.setProperty('--stub', palette.stub);
   root.setProperty('--stub-dark', palette.notch);
+}
+
+function drawTicketAtmosphere(ctx, cover, palette, width, height) {
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = palette.background;
+  ctx.fillRect(0, 0, width, height);
+  if (cover) {
+    ctx.save();
+    ctx.filter = 'blur(34px)';
+    ctx.globalAlpha = .54;
+    drawCrop(ctx, cover, -70, -70, width + 140, height + 140, 1.08);
+    ctx.restore();
+  }
+  ctx.globalAlpha = .70;
+  ctx.fillStyle = palette.background;
+  ctx.fillRect(0, 0, width, height);
+  ctx.globalAlpha = 1;
+  const shade = ctx.createLinearGradient(0, 0, width, height);
+  shade.addColorStop(0, 'rgba(0,0,0,.08)');
+  shade.addColorStop(.52, 'rgba(0,0,0,.20)');
+  shade.addColorStop(1, 'rgba(0,0,0,.38)');
+  ctx.fillStyle = shade;
+  ctx.fillRect(0, 0, width, height);
+  ctx.restore();
+}
+
+function applyStageBackdrop(cover, palette) {
+  const canvas = document.createElement('canvas');
+  canvas.width = RENDER_WIDTH;
+  canvas.height = RENDER_HEIGHT;
+  drawTicketAtmosphere(canvas.getContext('2d'), cover, palette, RENDER_WIDTH, RENDER_HEIGHT);
+  activeBackdropSurface = canvas;
+  $('#top').style.backgroundImage = `url("${canvas.toDataURL('image/png')}")`;
+}
+
+async function applyDefaultStageBackdrop() {
+  const cover = await loadDefaultTicketVisual();
+  applyStageBackdrop(cover, getCurrentTicketPalette());
 }
 
 function resetTheme() {
