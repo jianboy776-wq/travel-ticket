@@ -10,7 +10,11 @@ const memoryInput = $('#memory-upload');
 const videoInput = $('#video-upload');
 const createButton = $('#create-ticket');
 const toast = $('#toast');
+const pageTurnCanvas = $('#page-turn-overlay');
 let playbackResetTimer = null;
+let pageTurnPreviewFrame = 0;
+let pageTurnFramesPromise = null;
+let pageTurnFrames = [];
 const TICKET_TEAR_SECONDS = 1;
 const TICKET_OUTRO_SECONDS = .28;
 const PHOTO_PLAY_SECONDS = 7.6;
@@ -352,6 +356,7 @@ async function buildTicket() {
 function openTicket() {
   if (ticket.classList.contains('open') || ticket.classList.contains('tearing')) return;
   ticket.classList.add('tearing');
+  startPageTurnPreview();
   createTearParticles();
   playTearSound();
   if (navigator.vibrate) navigator.vibrate([24, 28, 18, 20, 10]);
@@ -417,7 +422,50 @@ function closeTicket() {
 function resetTicket() {
   clearTimeout(playbackResetTimer);
   ticket.classList.remove('open', 'tearing', 'closing');
+  cancelAnimationFrame(pageTurnPreviewFrame);
+  pageTurnCanvas.getContext('2d').clearRect(0, 0, pageTurnCanvas.width, pageTurnCanvas.height);
+  $('#stub').style.opacity = '';
   memory.setAttribute('aria-hidden', 'true');
+}
+
+function ensurePageTurnFrames() {
+  if (pageTurnFrames.length) return Promise.resolve(pageTurnFrames);
+  if (!pageTurnFramesPromise) {
+    pageTurnFramesPromise = Promise.all(Array.from({length:30}, (_, index) => new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = reject;
+      image.src = `assets/page-turn/turn-${String(index).padStart(2, '0')}.png`;
+    }))).then(images => (pageTurnFrames = images)).catch(error => {
+      console.warn('AE page-turn frames unavailable; using the built-in fallback.', error);
+      pageTurnFramesPromise = null;
+      return [];
+    });
+  }
+  return pageTurnFramesPromise;
+}
+
+function startPageTurnPreview() {
+  cancelAnimationFrame(pageTurnPreviewFrame);
+  ensurePageTurnFrames().then(frames => {
+    if (!frames.length || !ticket.classList.contains('tearing')) return;
+    const ctx = pageTurnCanvas.getContext('2d');
+    const started = performance.now();
+    const stubElement = $('#stub');
+    function frame(now) {
+      const p = Math.max(0, Math.min(1, (now - started) / (TICKET_TEAR_SECONDS * 1000)));
+      const blend = smoothstep(.28, .48, p);
+      ctx.clearRect(0, 0, 1080, 432);
+      stubElement.style.opacity = String(1 - blend);
+      if (blend > 0) {
+        const pose = exportTearPose(p, 270);
+        const image = frames[Math.min(frames.length - 1, Math.floor(p * frames.length))];
+        drawTintedPageFrame(ctx, image, 810 + pose.x, pose.y * 1.55, 270, 432, pose.rotation, state.palette || {stub:'#496c78'}, blend);
+      }
+      if (p < 1 && ticket.classList.contains('tearing')) pageTurnPreviewFrame = requestAnimationFrame(frame);
+    }
+    pageTurnPreviewFrame = requestAnimationFrame(frame);
+  });
 }
 
 function deleteTicket() {
@@ -482,6 +530,7 @@ async function renderTicketMp4WithWebCodecs({live = false} = {}) {
   const cover = await loadVisual(state.coverFile);
   const memoryImage = await loadVisual(state.imageFile || state.coverFile);
   const palette = state.palette || samplePalette(cover);
+  await ensurePageTurnFrames();
   let moving = null;
   if (state.videoFile || state.motionBlob) {
     moving = document.createElement('video');
@@ -578,6 +627,7 @@ async function renderTicketVideo({live = false} = {}) {
   const cover = await loadVisual(state.coverFile);
   const memoryImage = await loadVisual(state.imageFile || state.coverFile);
   const palette = state.palette || samplePalette(cover);
+  await ensurePageTurnFrames();
   let moving = null;
   if (state.videoFile || state.motionBlob) {
     moving = document.createElement('video');
@@ -681,12 +731,21 @@ function drawExportFrame(ctx, t, cover, memoryImage, moving, palette, suppliedTi
   if (intact) drawExportStub(ctx, x + w - stubW, y, stubW, h, 0, palette);
   else if (t < contentStart + .45) {
     drawExportTear(ctx, x + w - stubW, y, h, tearLinear, palette);
-    drawExportStub(ctx, x + w - stubW + stubPose.x, y + stubPose.y, stubW, h, stubPose.rotation, palette, {
-      torn: tearLinear > .18,
-      tearProgress: tearLinear,
-      shadow: .28 + stubPose.release * .48,
-      bend: Math.sin(Math.min(1, tearLinear) * Math.PI) * 9
-    });
+    const pageTurnBlend = pageTurnFrames.length ? smoothstep(.28, .48, tearLinear) : 0;
+    if (pageTurnBlend < 1) {
+      ctx.save(); ctx.globalAlpha = 1 - pageTurnBlend;
+      drawExportStub(ctx, x + w - stubW + stubPose.x, y + stubPose.y, stubW, h, stubPose.rotation, palette, {
+        torn: tearLinear > .18,
+        tearProgress: tearLinear,
+        shadow: .28 + stubPose.release * .48,
+        bend: Math.sin(Math.min(1, tearLinear) * Math.PI) * 9
+      });
+      ctx.restore();
+    }
+    if (pageTurnBlend > 0) {
+      const image = pageTurnFrames[Math.min(pageTurnFrames.length - 1, Math.floor(tearLinear * pageTurnFrames.length))];
+      drawTintedPageFrame(ctx, image, x + w - stubW + stubPose.x, y + stubPose.y, stubW, h, stubPose.rotation, palette, pageTurnBlend);
+    }
     drawExportRipFlash(ctx, x + w - stubW, y, h, tearLinear);
   } else if (t < resetAt) {
     drawExportTornEdge(ctx, x + w - stubW, y, h, .18);
@@ -831,7 +890,33 @@ function drawExportTornEdge(ctx, seamX, y, h, alpha = .2) {
   ctx.restore();
 }
 
+function drawTintedPageFrame(ctx, image, x, y, w, h, rotation, palette, alpha = 1) {
+  if (!image) return;
+  const surface = document.createElement('canvas');
+  surface.width = image.naturalWidth || image.width;
+  surface.height = image.naturalHeight || image.height;
+  const surfaceContext = surface.getContext('2d');
+  surfaceContext.drawImage(image, 0, 0);
+  surfaceContext.globalCompositeOperation = 'source-atop';
+  surfaceContext.globalAlpha = .82;
+  surfaceContext.fillStyle = palette.stub;
+  surfaceContext.fillRect(0, 0, surface.width, surface.height);
+  surfaceContext.globalCompositeOperation = 'source-over';
+  surfaceContext.globalAlpha = 1;
+
+  ctx.save();
+  ctx.globalAlpha *= alpha;
+  ctx.translate(x, y);
+  ctx.rotate(rotation);
+  ctx.drawImage(surface, 0, 0, w, h);
+  ctx.restore();
+}
+
 function lerp(a, b, p) { return a + (b - a) * p; }
+function smoothstep(start, end, value) {
+  const p = Math.max(0, Math.min(1, (value - start) / Math.max(.0001, end - start)));
+  return p * p * (3 - 2 * p);
+}
 function easeInOutCubic(v) { return v < .5 ? 4 * v * v * v : 1 - Math.pow(-2 * v + 2, 3) / 2; }
 function easeOutCubic(v) { return 1 - Math.pow(1 - v, 3); }
 

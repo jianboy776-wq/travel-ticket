@@ -8,3 +8,4 @@
 .memory-chooser{display:block}.memory-picks{display:flex;flex-wrap:wrap;gap:8px;margin-top:15px}.memory-picks .pick{display:inline-flex;align-items:center;background:#07342f;color:#fff;border-color:#07342f;cursor:pointer}.memory-picks input{display:none}.memory-picks .video-pick{background:#fff;color:#07342f}.chosen-file{display:block;margin-top:10px;font-size:9px;color:#77736b}
 @media(prefers-reduced-motion:reduce){.ticket.tearing .stub,.ticket.open .memory,.ticket.open .progress i{animation-duration:.01ms!important;animation-delay:0s!important}}
 .ticket:not(.tearing) .tear-edge{opacity:0}.ticket.tearing .tear-edge{opacity:1}
+.page-turn-overlay{position:absolute;inset:0;z-index:9;width:100%;height:100%;pointer-events:none}.ticket:not(.tearing) .page-turn-overlay{display:none}
