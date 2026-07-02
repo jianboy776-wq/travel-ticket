@@ -18,7 +18,9 @@ const TICKET_OUTRO_SECONDS = .28;
 const PHOTO_PLAY_SECONDS = 7.6;
 const EXPORT_TICKET_Y = 356;
 const LIVE_CROP_TOP = 318;
+const TICKET_ANIMATION_SEED = 848620;
 let ffmpegRuntimePromise = null;
+let defaultTicketVisualPromise = null;
 
 const state = {
   custom: false,
@@ -352,15 +354,13 @@ async function buildTicket() {
 async function openTicket() {
   if (ticket.classList.contains('open') || ticket.classList.contains('tearing') || ticket.classList.contains('preparing-turn')) return;
   let sharedRenderer = null;
-  if (state.custom && state.coverFile) {
-    ticket.classList.add('preparing-turn');
-    try {
-      sharedRenderer = await createTicketAnimationRenderer(memory.querySelector('video'));
-    } catch (error) {
-      console.warn('Shared ticket preview unavailable; using the DOM fallback.', error);
-    } finally {
-      ticket.classList.remove('preparing-turn');
-    }
+  ticket.classList.add('preparing-turn');
+  try {
+    sharedRenderer = await createTicketAnimationRenderer(memory.querySelector('video'));
+  } catch (error) {
+    console.warn('Shared ticket preview unavailable; using the DOM fallback.', error);
+  } finally {
+    ticket.classList.remove('preparing-turn');
   }
   ticket.classList.add('tearing');
   if (sharedRenderer) startPageTurnPreview(sharedRenderer);
@@ -379,7 +379,7 @@ async function openTicket() {
 
 function createTearParticles() {
   ticket.querySelectorAll('.tear-particle').forEach(piece => piece.remove());
-  const random = seededRandom(848620);
+  const random = seededRandom(TICKET_ANIMATION_SEED);
   for (let i = 0; i < 12; i++) {
     const piece = document.createElement('i');
     piece.className = 'tear-particle';
@@ -439,7 +439,7 @@ function closeTicket() {
 
 function resetTicket() {
   clearTimeout(playbackResetTimer);
-  ticket.classList.remove('open', 'tearing', 'closing');
+  ticket.classList.remove('open', 'tearing', 'closing', 'preparing-turn', 'canvas-tear-active');
   cancelAnimationFrame(pageTurnPreviewFrame);
   pageTurnCanvas.getContext('2d').clearRect(0, 0, pageTurnCanvas.width, pageTurnCanvas.height);
   pageTurnCanvas.classList.remove('shared-preview');
@@ -451,6 +451,7 @@ function startPageTurnPreview(renderer) {
   cancelAnimationFrame(pageTurnPreviewFrame);
   const ctx = pageTurnCanvas.getContext('2d');
   const started = performance.now();
+  ticket.classList.add('canvas-tear-active');
   pageTurnCanvas.classList.add('shared-preview');
   function frame(now) {
     const elapsed = (now - started) / 1000;
@@ -458,6 +459,7 @@ function startPageTurnPreview(renderer) {
     if (!active || elapsed >= renderer.timeline.total) {
       ctx.clearRect(0, 0, pageTurnCanvas.width, pageTurnCanvas.height);
       pageTurnCanvas.classList.remove('shared-preview');
+      ticket.classList.remove('canvas-tear-active');
       return;
     }
     if (renderer.moving && elapsed >= renderer.timeline.contentStart && elapsed < renderer.timeline.resetAt) {
@@ -546,7 +548,7 @@ async function renderTicketMp4WithWebCodecs({live = false} = {}) {
   output.addVideoTrack(source, {frameRate:fps});
   await output.start();
   const timeline = getExportTimeline(moving);
-  const renderer = new TicketAnimationRenderer({cover, memoryImage, moving, palette, timeline});
+  const renderer = new TicketAnimationRenderer({cover, memoryImage, moving, palette, timeline, coverLayout:getCurrentCoverLayout()});
   if (moving) { moving.pause(); moving.currentTime = 0; }
   const totalFrames = Math.floor(timeline.total * fps);
   for (let frame = 0; frame < totalFrames; frame++) {
@@ -641,7 +643,7 @@ async function renderTicketVideo({live = false} = {}) {
     moving.currentTime = 0;
   }
   const timeline = getExportTimeline(moving);
-  const renderer = new TicketAnimationRenderer({cover, memoryImage, moving, palette, timeline});
+  const renderer = new TicketAnimationRenderer({cover, memoryImage, moving, palette, timeline, coverLayout:getCurrentCoverLayout()});
   const mime = ['video/mp4','video/webm;codecs=vp9','video/webm'].find(type => MediaRecorder.isTypeSupported(type));
   if (!mime) throw new Error('MediaRecorder unsupported');
   const recorder = new MediaRecorder(canvas.captureStream(mobileExport ? 24 : 30), { mimeType: mime, videoBitsPerSecond: mobileExport ? 3_000_000 : 5_000_000 });
@@ -705,23 +707,24 @@ function getExportTimeline(moving) {
 }
 
 class TicketAnimationRenderer {
-  constructor({cover, memoryImage, moving, palette, timeline = null}) {
+  constructor({cover, memoryImage, moving, palette, timeline = null, coverLayout = null}) {
     this.cover = cover;
     this.memoryImage = memoryImage;
     this.moving = moving;
     this.palette = palette;
+    this.coverLayout = coverLayout || {mode:'fill', x:50, y:50, zoom:100};
     this.timeline = timeline || getExportTimeline(moving);
     this.canonicalSurface = document.createElement('canvas');
     this.canonicalSurface.width = 720;
     this.canonicalSurface.height = 1280;
     this.canonicalContext = this.canonicalSurface.getContext('2d');
-    this.seed = 848620;
+    this.seed = TICKET_ANIMATION_SEED;
   }
 
   renderCanonical(time) {
     this.canonicalContext.setTransform(1, 0, 0, 1, 0, 0);
     this.canonicalContext.clearRect(0, 0, 720, 1280);
-    drawExportFrame(this.canonicalContext, time, this.cover, this.memoryImage, this.moving, this.palette, this.timeline);
+    drawExportFrame(this.canonicalContext, time, this.cover, this.memoryImage, this.moving, this.palette, this.timeline, this.coverLayout, this.seed);
     return this.canonicalSurface;
   }
 
@@ -745,10 +748,44 @@ class TicketAnimationRenderer {
 
 async function createTicketAnimationRenderer(moving = null) {
   await waitForTicketAssets(moving);
-  const cover = await loadVisual(state.coverFile);
-  const memoryImage = await loadVisual(state.imageFile || state.coverFile);
-  const palette = state.palette || samplePalette(cover);
-  return new TicketAnimationRenderer({cover, memoryImage, moving, palette});
+  const defaultVisual = state.coverFile ? null : await loadDefaultTicketVisual();
+  const cover = state.coverFile ? await loadVisual(state.coverFile) : defaultVisual;
+  const memoryImage = state.imageFile || state.coverFile ? await loadVisual(state.imageFile || state.coverFile) : defaultVisual;
+  const palette = state.palette || getCurrentTicketPalette();
+  const coverLayout = getCurrentCoverLayout();
+  return new TicketAnimationRenderer({cover, memoryImage, moving, palette, coverLayout});
+}
+
+function getCurrentCoverLayout() {
+  return state.custom
+    ? {mode:state.coverMode, x:state.coverX, y:state.coverY, zoom:state.coverZoom / 100}
+    : {mode:'fill', x:50, y:50, zoom:1};
+}
+
+async function loadDefaultTicketVisual() {
+  if (!defaultTicketVisualPromise) {
+    defaultTicketVisualPromise = (async () => {
+      const response = await fetch('assets/journey-board.png');
+      if (!response.ok) throw new Error('Default ticket artwork failed to load');
+      const source = await createImageBitmap(await response.blob());
+      const surface = document.createElement('canvas');
+      surface.width = 812;
+      surface.height = 432;
+      surface.getContext('2d').drawImage(source, 0, 0, 812, 432, 0, 0, 812, 432);
+      source.close?.();
+      return surface;
+    })();
+  }
+  return defaultTicketVisualPromise;
+}
+
+function getCurrentTicketPalette() {
+  const style = getComputedStyle(document.documentElement);
+  return {
+    background: style.getPropertyValue('--bg').trim() || '#07342f',
+    stub: style.getPropertyValue('--stub').trim() || '#496c78',
+    notch: style.getPropertyValue('--stub-dark').trim() || '#06425d'
+  };
 }
 
 async function waitForTicketAssets(moving = null) {
@@ -773,7 +810,7 @@ async function seekVideoForFrame(video, time) {
   });
 }
 
-function drawExportFrame(ctx, t, cover, memoryImage, moving, palette, suppliedTimeline = null) {
+function drawExportFrame(ctx, t, cover, memoryImage, moving, palette, suppliedTimeline = null, coverLayout = null, seed = TICKET_ANIMATION_SEED) {
   const W = 720, H = 1280, x = 54, y = EXPORT_TICKET_Y, w = 612, h = 245, stubW = 154;
   const timeline = suppliedTimeline || getExportTimeline(moving);
   const {tearStart, tearDuration, contentStart, resetAt} = timeline;
@@ -782,17 +819,10 @@ function drawExportFrame(ctx, t, cover, memoryImage, moving, palette, suppliedTi
   const stubPose = exportTearPose(tearLinear, stubW);
   const revealProgress = t >= contentStart ? 1 : 0;
   ctx.fillStyle = palette.background; ctx.fillRect(0, 0, W, H);
-  if (!intact && t < contentStart) {
-    ctx.save();
-    ctx.globalAlpha = .14 * Math.sin(tearLinear * Math.PI);
-    ctx.fillStyle = '#000';
-    roundedPath(ctx, x + 4, y + 10, w, h, 13);
-    ctx.fill();
-    ctx.restore();
-  }
   ctx.save(); roundedPath(ctx, x, y, w, h, 13); ctx.clip();
   if (intact || t < contentStart) {
-    drawCrop(ctx, cover, x, y, w - stubW, h, 1);
+    const tug = !intact && t < Math.min(contentStart, .44) ? -2 * Math.sin((t / .22) * Math.PI) : 0;
+    drawTicketCover(ctx, cover, x + tug, y, w - stubW, h, coverLayout);
   }
   if (!intact && t >= contentStart) {
     ctx.globalAlpha = revealProgress;
@@ -802,14 +832,12 @@ function drawExportFrame(ctx, t, cover, memoryImage, moving, palette, suppliedTi
   ctx.restore();
   if (intact) drawExportStub(ctx, x + w - stubW, y, stubW, h, 0, palette);
   else if (t < contentStart) {
-    drawExportTear(ctx, x + w - stubW, y, h, tearLinear, palette);
+    drawReferenceTear(ctx, x + w - stubW, y, h, tearLinear, palette, seed);
     drawExportStub(ctx, x + w - stubW + stubPose.x, y + stubPose.y, stubW, h, stubPose.rotation, palette, {
-      torn: tearLinear > .30,
-      tearProgress: tearLinear,
-      shadow: .18 + stubPose.release * .30,
-      bend: Math.sin(Math.min(1, tearLinear) * Math.PI) * 4
+      shadow: .12 + stubPose.release * .12,
+      opacity: tearLinear < .82 ? 1 : Math.max(0, (1 - tearLinear) / .18),
+      perforated: true
     });
-    drawExportRipFlash(ctx, x + w - stubW, y, h, tearLinear);
   }
 }
 
@@ -817,11 +845,11 @@ function exportTearPose(p, stubW) {
   const release = easeOutCubic(Math.max(0, (p - .48) / .52));
   const cssLike = [
     {p:0, x:0, y:0, r:0},
-    {p:.20, x:-4, y:0, r:-.6},
-    {p:.38, x:7, y:-2, r:.8},
-    {p:.52, x:1, y:1, r:-.8},
-    {p:.68, x:31, y:-1, r:3},
-    {p:.82, x:78, y:7, r:7},
+    {p:.20, x:-stubW * .017, y:0, r:-.6},
+    {p:.38, x:stubW * .030, y:-1.3, r:.8},
+    {p:.52, x:stubW * .004, y:.7, r:-.8},
+    {p:.68, x:stubW * .132, y:-.7, r:3},
+    {p:.82, x:stubW * .332, y:4.6, r:7},
     {p:1, x:stubW * 1.35, y:31, r:12}
   ];
   let a = cssLike[0], b = cssLike[cssLike.length - 1];
@@ -832,7 +860,7 @@ function exportTearPose(p, stubW) {
   }
   const local = a === b ? 1 : easeInOutCubic((p - a.p) / Math.max(.001, b.p - a.p));
   return {
-    x: lerp(a.x, b.x, local) + (1 - release) * Math.sin(p * 46) * 3,
+    x: lerp(a.x, b.x, local),
     y: lerp(a.y, b.y, local),
     rotation: lerp(a.r, b.r, local) * Math.PI / 180,
     release
@@ -854,34 +882,26 @@ function drawJaggedStubPath(ctx, w, h, bend = 0, tearProgress = 1) {
 
 function drawExportStub(ctx, x, y, w, h, rotation, palette, options = {}) {
   ctx.save(); ctx.translate(x, y); ctx.rotate(rotation);
+  ctx.globalAlpha = options.opacity ?? 1;
   if (options.shadow) {
     ctx.save();
     ctx.globalAlpha = options.shadow;
     ctx.fillStyle = 'rgba(0,0,0,.36)';
     ctx.filter = 'blur(10px)';
     ctx.translate(-14, 17);
-    if (options.torn) drawJaggedStubPath(ctx, w, h, options.bend || 0, options.tearProgress); else ctx.rect(0, 0, w, h);
+    ctx.rect(0, 0, w, h);
     ctx.fill();
     ctx.restore();
   }
   ctx.fillStyle = palette.stub;
-  if (options.torn) {
-    drawJaggedStubPath(ctx, w, h, options.bend || 0, options.tearProgress);
-    ctx.fill();
+  ctx.fillRect(0, 0, w, h);
+  if (options.perforated) {
     ctx.save();
-    ctx.globalAlpha = .44;
-    ctx.strokeStyle = 'rgba(255,255,255,.58)';
-    ctx.lineWidth = 2.4;
-    ctx.beginPath();
-    for (let py = 4; py <= h - 4; py += 12) {
-      const tornHere = py <= h * Math.min(1, options.tearProgress ?? 1);
-      const px = tornHere ? (Math.floor(py / 12) % 2 ? 6 : -3) + Math.sin(py * .09) * 2 + Math.sin((py / h) * Math.PI) * (options.bend || 0) : 0;
-      if (py === 4) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-    }
-    ctx.stroke();
+    ctx.strokeStyle = 'rgba(247,241,226,.72)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([5, 6]);
+    ctx.beginPath(); ctx.moveTo(1, 0); ctx.lineTo(1, h); ctx.stroke();
     ctx.restore();
-  } else {
-    ctx.fillRect(0, 0, w, h);
   }
   ctx.fillStyle = palette.notch; ctx.beginPath(); ctx.arc(w, h / 2, 22, 0, Math.PI * 2); ctx.fill();
   ctx.fillStyle = '#f7f4e9'; ctx.font = 'bold 31px Arial';
@@ -892,32 +912,46 @@ function drawExportStub(ctx, x, y, w, h, rotation, palette, options = {}) {
   ctx.restore();
 }
 
-function drawExportTear(ctx, seamX, y, h, progress, palette) {
-  if (progress <= 0 || progress >= .96) return;
-  ctx.save();
-  ctx.save();
-  ctx.globalAlpha = .12 + .24 * Math.sin(progress * Math.PI);
-  ctx.fillStyle = '#000';
-  ctx.fillRect(seamX - 5, y, 14 + progress * 14, h);
-  ctx.restore();
-  ctx.globalAlpha = .68;
-  ctx.strokeStyle = 'rgba(247,241,226,.92)'; ctx.lineWidth = 2.2;
-  ctx.beginPath();
-  const visible = h * Math.min(1, progress);
-  for (let py = 0; py <= visible; py += 7) {
-    const px = seamX + (Math.floor(py / 7) % 2 ? 7 : -5) + Math.sin(py * .12 + progress * 7) * 2;
-    if (py === 0) ctx.moveTo(px, y + py); else ctx.lineTo(px, y + py);
+function drawReferenceTear(ctx, seamX, y, h, progress, palette, seed) {
+  if (progress <= 0 || progress >= 1) return;
+  const ripProgress = Math.min(1, progress / .67);
+  const ripAlpha = ripProgress < .18
+    ? ripProgress / .18 * .8
+    : Math.max(0, .8 * (1 - (ripProgress - .18) / .82));
+  if (ripAlpha > 0) {
+    ctx.save();
+    ctx.globalAlpha = ripAlpha;
+    ctx.strokeStyle = 'rgba(245,239,224,.92)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([5, 5]);
+    ctx.beginPath(); ctx.moveTo(seamX, y); ctx.lineTo(seamX, y + h * ripProgress); ctx.stroke();
+    ctx.restore();
   }
-  ctx.stroke();
-  const release = easeOutCubic(Math.max(0, (progress - .15) / .85));
-  ctx.fillStyle = 'rgba(238,229,210,.98)';
-  for (let i = 0; i < 18; i++) {
-    const phase = (i * .31 + release) % 1;
-    const px = seamX + 4 + release * (34 + i * 5);
-    const py = y + 10 + i * 13 + Math.sin(phase * 11) * 13;
-    ctx.save(); ctx.translate(px, py); ctx.rotate(release * 5.6 + i * .7); ctx.fillRect(-4, -2, 10, 4); ctx.restore();
+
+  const elapsed = progress * TICKET_TEAR_SECONDS;
+  const random = seededRandom(seed);
+  ctx.fillStyle = 'rgba(232,224,207,.92)';
+  for (let i = 0; i < 12; i++) {
+    const py = .08 + random() * .84;
+    const size = (4 + random() * 7) * .65;
+    const delay = .18 + random() * .35;
+    const drift = random() * 30 * .65;
+    const fall = (random() * 40 - 15) * .65;
+    const local = Math.max(0, Math.min(1, (elapsed - delay) / .8));
+    if (local <= 0 || local >= 1) continue;
+    const eased = easeOutCubic(local);
+    const px = seamX + eased * (18 + drift);
+    const yy = y + py * h + eased * (-8 + fall);
+    ctx.save();
+    ctx.globalAlpha = 1 - local;
+    ctx.translate(px, yy);
+    ctx.rotate(eased * 2.8 + i * .31);
+    ctx.beginPath();
+    ctx.moveTo(-size, -size * .2); ctx.lineTo(size, -size * .35);
+    ctx.lineTo(size * .65, size * .35); ctx.lineTo(-size * .7, size * .25);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
   }
-  ctx.restore();
 }
 
 function drawExportRipFlash(ctx, seamX, y, h, progress) {
@@ -1028,6 +1062,32 @@ function drawCrop(ctx, source, x, y, w, h, zoom = 1) {
   const scale = Math.max(w / sw, h / sh) * zoom;
   const dw = sw * scale, dh = sh * scale;
   ctx.drawImage(source, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+}
+
+function drawTicketCover(ctx, source, x, y, w, h, layout = null) {
+  const mode = layout?.mode || 'fill';
+  const sw = source.videoWidth || source.naturalWidth || source.width;
+  const sh = source.videoHeight || source.naturalHeight || source.height;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+  if (mode === 'fit') {
+    ctx.save();
+    ctx.filter = 'blur(10px)';
+    ctx.globalAlpha = .72;
+    drawCrop(ctx, source, x, y, w, h, 1.12);
+    ctx.restore();
+    const scale = Math.min(w / sw, h / sh);
+    const dw = sw * scale, dh = sh * scale;
+    ctx.drawImage(source, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  } else {
+    const zoom = Math.max(1, layout?.zoom || 1);
+    const scale = Math.max(w / sw, h / sh) * zoom;
+    const dw = sw * scale, dh = sh * scale;
+    const px = Math.max(0, Math.min(1, (layout?.x ?? 50) / 100));
+    const py = Math.max(0, Math.min(1, (layout?.y ?? 50) / 100));
+    ctx.drawImage(source, x + (w - dw) * px, y + (h - dh) * py, dw, dh);
+  }
+  ctx.restore();
 }
 
 function roundedPath(ctx, x, y, w, h, r) {
